@@ -25,7 +25,20 @@ use crate::{
     card_db::{CardDB, CardData},
 };
 
-pub async fn print_events(player1: &str, player2: &str, card_db: &CardDB) {
+fn is_command(text: &str) -> bool {
+    text.starts_with(":")
+}
+
+fn life_update(text: &str) -> bool {
+    text.starts_with("-1") || text.starts_with("-2")
+}
+
+async fn print_events(
+    player1: &str,
+    player2: &str,
+    card_db: &CardDB,
+    player_life: Option<(String, String)>,
+) {
     let mut reader = EventStream::new();
     let mut text = String::new();
     let mut suggestions: VecDeque<&CardData> = VecDeque::new();
@@ -33,7 +46,19 @@ pub async fn print_events(player1: &str, player2: &str, card_db: &CardDB) {
     let output_fp = format!("{}_v_{}_{}.csv", player1, player2, chrono::Local::now());
     let mut output_file = File::create(output_fp).expect("Couldn't write to file");
 
-    let _ = write!(output_file, "sec\tmilli\tuuid\tname\tpitch\n");
+    let _ = write!(
+        output_file,
+        "sec\tmilli\tuuid\tname\tpitch\tplayer1_life\tplayer2_life\tupdate_type\n"
+    );
+
+    // Set starting life totals if given
+    if let Some((player1, player2)) = player_life {
+        let _ = write!(
+            output_file,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            0, 0, "", "", "", player1, player2, "life"
+        );
+    }
 
     let start_time = time::Instant::now();
     let mut offset = Duration::from_secs(0);
@@ -49,14 +74,101 @@ pub async fn print_events(player1: &str, player2: &str, card_db: &CardDB) {
                     Some(Ok(event)) => {
                         if let Event::Key(key) = event {
                             if paused {
+                                // If paused, unpause on space, enter, or esc
                                 match key.code {
-                                    KeyCode::Home => {
-                                        paused = false;
-                                        offset += time::Instant::now() - start_paused_time;
-                                    }
+                                    KeyCode::Enter => {},
+                                    KeyCode::Char(' ') => {}
+                                    KeyCode::Esc => {}
                                     _ => {
                                         continue;
                                     }
+                                }
+                                paused = false;
+                                offset += time::Instant::now() - start_paused_time;
+                                text = String::new();
+                                suggestions = VecDeque::new();
+                            } else if is_command(&text) {
+                                match key.code {
+                                    KeyCode::Char(c) => {
+                                        text.push(c);
+                                    },
+                                    KeyCode::Backspace => {
+                                        text.pop();
+                                    },
+                                    KeyCode::Esc => {
+                                        text = String::new();
+                                        suggestions = VecDeque::new();
+                                    },
+                                    KeyCode::Enter => {
+                                        if text.starts_with(":q") {
+                                            println!();
+                                            break;
+                                        } else if text.starts_with(":p") {
+                                            paused = true;
+                                            start_paused_time = time::Instant::now();
+                                        } else {
+                                            let pos = position().unwrap();
+                                            let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
+                                            println!("> Command '{}' not recognized", text);
+                                            text = String::new();
+                                            suggestions = VecDeque::new();
+                                        }
+                                    }
+                                    _ => continue
+                                }
+                            } else if life_update(&text) {
+                                match key.code {
+                                    KeyCode::Char(c) => {
+                                        text.push(c);
+                                    },
+                                    KeyCode::Backspace => {
+                                        text.pop();
+                                    },
+                                    KeyCode::Enter => {
+                                        let split: Vec<&str> = text.split(" ").collect();
+                                        if split.len() == 2 {
+                                            let player = split[0];
+                                            let life = split[1];
+
+                                            if (player != "-1" && player != "-2") || life.parse::<i32>().is_err() {
+                                                let pos = position().unwrap();
+                                                let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
+                                                println!("> Invalid life command. Should be of format '-1 30' or '-2 28'.");
+                                            } else {
+                                                let time_stamp = time::Instant::now() - start_time - offset;
+
+                                                let (player1, player2) = {
+                                                    if player == "-1" {
+                                                        println!("Player 1's life set to {}", life);
+                                                        (Some(life), None)
+                                                    } else {
+                                                        println!("Player 2's life set to {}", life);
+                                                        (None, Some(life))
+                                                    }
+                                                };
+
+                                                let _ = write!(
+                                                    output_file,
+                                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                                    time_stamp.as_secs(),
+                                                    time_stamp.as_millis(),
+                                                    "",
+                                                    "",
+                                                    "",
+                                                    player1.unwrap_or(""),
+                                                    player2.unwrap_or(""),
+                                                    "life"
+                                                );
+                                            }
+
+                                            let pos = position().unwrap();
+                                            let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
+                                            println!("> {}", text);
+                                            text = String::new();
+                                            suggestions = VecDeque::new();
+                                        }
+                                    }
+                                    _ => continue
                                 }
                             } else {
                                 match key.code {
@@ -68,7 +180,8 @@ pub async fn print_events(player1: &str, player2: &str, card_db: &CardDB) {
                                         text.pop();
                                     },
                                     KeyCode::Esc => {
-                                        break;
+                                        text = String::new();
+                                        suggestions = VecDeque::new()
                                     },
                                     KeyCode::BackTab => {
                                         suggestions.rotate_right(1);
@@ -81,12 +194,15 @@ pub async fn print_events(player1: &str, player2: &str, card_db: &CardDB) {
                                             let time_stamp = time::Instant::now() - start_time - offset;
                                             let _ = write!(
                                                 output_file,
-                                                "{}\t{}\t{}\t{}\t{}\n",
+                                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                                                 time_stamp.as_secs(),
                                                 time_stamp.as_millis(),
                                                 suggest.uuid,
                                                 suggest.name,
-                                                suggest.pitch_str()
+                                                suggest.pitch_str(),
+                                                "",
+                                                "",
+                                                "card"
                                             );
 
                                             let pos = position().unwrap();
@@ -96,13 +212,10 @@ pub async fn print_events(player1: &str, player2: &str, card_db: &CardDB) {
                                             suggestions = VecDeque::new();
                                         }
                                     }
-                                    KeyCode::Home => {
-                                        paused = true;
-                                        start_paused_time = time::Instant::now();
-                                    }
                                     _ => continue
                                 }
                             }
+
                             let pos = position().unwrap();
                             let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
 
@@ -131,7 +244,7 @@ pub async fn print_events(player1: &str, player2: &str, card_db: &CardDB) {
 }
 
 #[tokio::main]
-pub async fn main() -> std::io::Result<()> {
+async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         println!("Player name arguments missing");
@@ -139,9 +252,28 @@ pub async fn main() -> std::io::Result<()> {
     }
     let player1 = args[1].to_string();
     let player2 = args[2].to_string();
-    println!("Press Enter to begin:");
-    let mut input: String = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
+    let mut player_life = None;
+    loop {
+        println!("Enter starting life for both heroes or press enter to use default values:");
+        let mut input: String = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        let input = input.trim();
+        if input.is_empty() {
+            break;
+        }
+
+        let split = input.split(" ").collect::<Vec<&str>>();
+        if split.len() == 2 {
+            let life1 = split[0];
+            let life2 = split[1];
+            if life1.parse::<u32>().is_ok() && life2.parse::<u32>().is_ok() {
+                let _ = player_life.insert((life1.to_string(), life2.to_string()));
+                break;
+            }
+        }
+
+        println!("Invalid input.");
+    }
     println!("Timer started!");
     print!("> ");
 
@@ -152,7 +284,7 @@ pub async fn main() -> std::io::Result<()> {
 
     let card_db = CardDB::init();
 
-    print_events(&player1, &player2, &card_db).await;
+    print_events(&player1, &player2, &card_db, player_life).await;
 
     execute!(stdout)?;
 

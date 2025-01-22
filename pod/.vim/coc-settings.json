@@ -4,6 +4,7 @@
     "MILLI",
     "fourcc",
     "imgcodecs",
+    "imgproc",
     "imread",
     "opencv",
     "videoio"

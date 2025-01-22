@@ -2,7 +2,7 @@ use clap::Parser;
 use opencv::{
     core::{self, tempfile, Mat, MatTrait, MatTraitConst, Point, Scalar, Size},
     imgcodecs,
-    // imgproc::{put_text, FONT_HERSHEY_COMPLEX, LINE_AA},
+    imgproc::{self, put_text, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX, LINE_8, LINE_AA},
     videoio::{
         self, VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst, VideoWriter,
         VideoWriterTrait,
@@ -11,67 +11,53 @@ use opencv::{
 };
 use pod::CardDB;
 use serde::Deserialize;
-use serde_json::Value;
-use std::{collections::VecDeque, fs::File, io::Read, ops::Sub};
+use std::{borrow::BorrowMut, collections::VecDeque, ops::Sub};
+use textwrap::Options;
 
-// Defaults
-const DEFAULT_MAX_TRANSPARENCY: f64 = 0.8;
-const DEFAULT_FADE_IN_DURATION: f64 = 0.75;
-const DEFAULT_DISPLAY_DURATION: f64 = 6.0;
-const DEFAULT_FADE_OUT_DURATION: f64 = 0.75;
+// Card display
+const MAX_TRANSPARENCY: f64 = 0.8;
+const FADE_IN_DURATION: f64 = 0.75;
+const DISPLAY_DURATION: f64 = 6.0;
+const FADE_OUT_DURATION: f64 = 0.75;
 
-const CARD_WIDTH: i32 = 450;
-const CARD_HEIGHT: i32 = 628;
-
+// Constants
+const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
 const MILLI: f64 = 1_000.0;
 
-struct Config {
-    max_transparency: f64,
-    fade_in_duration: f64,
-    display_duration: f64,
-    fade_out_duration: f64,
-}
+// Scoreboard dimensions
+const SCOREBOARD_WIDTH_RATIO: f64 = 0.2;
+const SCOREBOARD_HEIGHT_BUFFER_RATIO: f64 = 0.02;
+const SCOREBOARD_WIDTH_BUFFER_RATIO: f64 = 0.01;
 
-impl Config {
-    fn load_from_file(fp: String) -> Self {
-        let mut data = String::new();
+// Fonts
+const SCORE_FONT_SCALE: f64 = 7.0;
+const SCORE_FONT_STYLE: i32 = FONT_HERSHEY_SCRIPT_COMPLEX;
+const SCORE_FONT_WIDTH: i32 = 8;
 
-        File::open(fp)
-            .expect("Could not load find config file")
-            .read_to_string(&mut data)
-            .expect("Could not load config file");
-        let json: Value = serde_json::from_str(&data).expect("Could not read config file.");
+const HERO_FONT_SCALE: f64 = 2.0;
+const HERO_FONT_STYLE: i32 = FONT_HERSHEY_SIMPLEX;
+const HERO_FONT_WIDTH: i32 = 4;
+const HERO_TEXT_LENGTH: Options = Options::new(20);
 
-        // Probably figure out a better way to do this later
-        // Built in default uses a function, which seems just as tedious
-        Config {
-            max_transparency: json
-                .get("max_transparency")
-                .and_then(Value::as_f64)
-                .unwrap_or(DEFAULT_MAX_TRANSPARENCY),
-            fade_in_duration: json
-                .get("fade_in_duration")
-                .and_then(Value::as_f64)
-                .unwrap_or(DEFAULT_FADE_IN_DURATION),
-            display_duration: json
-                .get("display_duration")
-                .and_then(Value::as_f64)
-                .unwrap_or(DEFAULT_DISPLAY_DURATION),
-            fade_out_duration: json
-                .get("fade_out_duration")
-                .and_then(Value::as_f64)
-                .unwrap_or(DEFAULT_FADE_OUT_DURATION),
-        }
-    }
-}
+// Life
+const LIFE_TICK: f64 = 250.0;
 
-#[derive(Deserialize)]
-struct CardRow {
+// File Constants
+const LIFE_DATA_TYPE: &str = "life";
+const CARD_DATA_TYPE: &str = "card";
+
+// Logo
+const LOGO_FP: &str = "data/Fleshandblood_Medium_500.png";
+
+#[derive(Deserialize, Debug)]
+struct DataRow {
     sec: u64,
     milli: f64,
-    uuid: String,
     name: String,
     pitch: Option<u32>,
+    player1_life: Option<i32>,
+    player2_life: Option<i32>,
+    update_type: String,
 }
 
 #[derive(Parser)]
@@ -84,13 +70,16 @@ struct Cli {
     card_file: String,
 
     #[arg(long)]
-    cfg: String,
+    hero1: String,
+
+    #[arg(long)]
+    hero2: String,
 
     #[arg(short, long)]
     timeout: Option<u64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct TimeTick {
     sec: u64,
     milli: f64,
@@ -161,10 +150,10 @@ enum FadeStage {
 
 fn main() -> Result<(), Error> {
     let args = Cli::parse();
+    let hero = format!("{}\n vs\n{}", args.hero1, args.hero2);
 
-    let cfg = Config::load_from_file(args.cfg);
-
-    let mut rows: VecDeque<Result<CardRow, csv::Error>> = csv::ReaderBuilder::new()
+    // Load game stats
+    let mut rows: VecDeque<Result<DataRow, csv::Error>> = csv::ReaderBuilder::new()
         .delimiter(b'\t')
         .from_path(args.card_file)
         .expect("Could not load card file")
@@ -173,13 +162,42 @@ fn main() -> Result<(), Error> {
 
     let output_path = "output_video.mp4";
 
+    // Create capture
     let mut cap = VideoCapture::from_file(&args.video_file, videoio::CAP_ANY)?;
-    let frame_width = cap.get(videoio::CAP_PROP_FRAME_WIDTH)?;
-    let frame_height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)?;
+    let original_width = cap.get(videoio::CAP_PROP_FRAME_WIDTH)?;
+    let original_height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)?;
     let fps = cap.get(videoio::CAP_PROP_FPS)?;
+
+    // Calculate Rotated Dimensions
+    let rotate = original_width < original_height;
+    let rotated_width = original_height;
+    let rotated_height = original_width;
+
+    // Set Frame Dimensions
+    let frame_height = if rotate {
+        rotated_height
+    } else {
+        original_height
+    };
+    let frame_width = if rotate {
+        rotated_width
+    } else {
+        original_width
+    };
+
+    // Scoreboard dimensions
+    let scoreboard_width = (frame_width * SCOREBOARD_WIDTH_RATIO) as i32;
+    let scoreboard_width_buffer = (frame_width * SCOREBOARD_WIDTH_BUFFER_RATIO) as i32;
+    let scoreboard_height_buffer = (frame_height * SCOREBOARD_HEIGHT_BUFFER_RATIO) as i32;
+    let scoreboard_height = (frame_height as i32) - 5 * scoreboard_height_buffer;
+
+    // Card dimensions
+    let card_height = scoreboard_height / 2;
+    let card_width = ((card_height as f64) * CARD_WIDTH_RATIO) as i32;
 
     let increment = fps.recip() * MILLI;
 
+    // Generate output video
     let mut out = VideoWriter::new(
         output_path,
         VideoWriter::fourcc('m', 'p', '4', 'v').unwrap(),
@@ -188,12 +206,36 @@ fn main() -> Result<(), Error> {
         true,
     )?;
 
+    // Load card db
     let card_db = CardDB::init();
 
+    // Set init vars
     let mut display_start_time = None;
     let mut time_tick = TimeTick::new();
-    let mut display_card: VecDeque<CardRow> = VecDeque::new();
+    let mut display_card: VecDeque<DataRow> = VecDeque::new();
     let image_file = tempfile(".png").unwrap();
+
+    // Set default life
+    let mut player1_life: i32 = 40;
+    let mut player2_life: i32 = 40;
+
+    // Check for init lifes row
+    let first_row = &rows
+        .front()
+        .expect("Empty data file")
+        .as_ref()
+        .expect("Broken data found at first row");
+    if first_row.update_type == LIFE_DATA_TYPE {
+        player1_life = first_row.player1_life.unwrap_or(40);
+        player2_life = first_row.player2_life.unwrap_or(40);
+    }
+
+    // Track what the players lives should be so we can tick them down
+    let mut player1_display_life: i32 = player1_life;
+    let mut player2_display_life: i32 = player2_life;
+
+    let mut life_ticker = 0;
+    let life_ticker_mod = (LIFE_TICK / increment) as u32;
 
     loop {
         if let Some(sec) = args.timeout {
@@ -210,13 +252,147 @@ fn main() -> Result<(), Error> {
             break;
         }
 
-        // Add card to queue
+        // Draw Scoreboard
+        let _ = imgproc::rectangle(
+            &mut frame,
+            core::Rect::new(0, 0, scoreboard_width, frame_height as i32),
+            Scalar::new(0.0, 0.0, 0.0, 0.0),
+            -1, // Thickness of -1 fills the rectangle completely
+            LINE_8,
+            0,
+        );
+
+        // Increment life ticker
+        life_ticker += 1;
+        life_ticker = life_ticker % life_ticker_mod;
+
+        // Update life totals
+        if life_ticker == 0 {
+            if player1_display_life != player1_life {
+                player1_display_life += (player1_life - player1_display_life).signum();
+            }
+            if player2_display_life != player2_life {
+                player2_display_life += (player2_life - player2_display_life).signum();
+            }
+        }
+
+        // Player1 Life
+        put_text(
+            &mut frame,
+            &player1_display_life.to_string(),
+            Point::new(
+                scoreboard_width_buffer,
+                scoreboard_height / 6 - scoreboard_height_buffer,
+            ),
+            SCORE_FONT_STYLE,
+            SCORE_FONT_SCALE,
+            Scalar::new(255.0, 255.0, 255.0, 0.0),
+            SCORE_FONT_WIDTH,
+            LINE_AA,
+            false,
+        )?;
+        // Player2 Life
+        put_text(
+            &mut frame,
+            &player2_display_life.to_string(),
+            Point::new(
+                scoreboard_width / 2 + scoreboard_width_buffer,
+                scoreboard_height / 6 - scoreboard_height_buffer,
+            ),
+            SCORE_FONT_STYLE,
+            SCORE_FONT_SCALE,
+            Scalar::new(255.0, 255.0, 255.0, 0.0),
+            SCORE_FONT_WIDTH,
+            LINE_AA,
+            false,
+        )?;
+        // Draw Line between player lives
+        let _ = imgproc::line(
+            &mut frame,
+            Point::new(scoreboard_width / 2, scoreboard_height_buffer),
+            Point::new(
+                scoreboard_width / 2,
+                scoreboard_height_buffer + scoreboard_height / 6,
+            ),
+            Scalar::new(255.0, 255.0, 255.0, 255.0),
+            SCORE_FONT_WIDTH,
+            LINE_AA,
+            0,
+        );
+
+        // GoToOne Logo
+        let mut logo_image = imgcodecs::imread(&LOGO_FP, imgcodecs::IMREAD_COLOR).unwrap();
+        opencv::imgproc::resize(
+            &logo_image.clone(),
+            &mut logo_image,
+            Size::new(
+                scoreboard_width - 2 * scoreboard_width_buffer,
+                scoreboard_height / 6,
+            ),
+            0.0,
+            0.0,
+            opencv::imgproc::INTER_LINEAR,
+        )?;
+        let mut logo_roi = frame.roi_mut(core::Rect::new(
+            scoreboard_width_buffer,
+            2 * scoreboard_height_buffer + (scoreboard_height / 6),
+            scoreboard_width - 2 * scoreboard_width_buffer,
+            scoreboard_height / 6,
+        ))?;
+        let _ = logo_image.copy_to(logo_roi.borrow_mut());
+
+        // Hero names
+        let wrapped_hero = textwrap::wrap(&hero, HERO_TEXT_LENGTH);
+        for (e, line) in wrapped_hero.iter().enumerate() {
+            let e = e as i32;
+            put_text(
+                &mut frame,
+                line,
+                Point::new(
+                    scoreboard_width_buffer,
+                    2 * (scoreboard_height / 6)
+                        + 3 * (scoreboard_height_buffer)
+                        + ((e + 1) * (frame_height as i32 / 30)),
+                ),
+                HERO_FONT_STYLE,
+                HERO_FONT_SCALE,
+                Scalar::new(255.0, 255.0, 255.0, 0.0),
+                HERO_FONT_WIDTH,
+                LINE_AA,
+                false,
+            )?;
+        }
+
+        // Rotate frame if necessary
+        if rotate {
+            let mut rotated_frame = Mat::default();
+            core::transpose(&frame, &mut rotated_frame)?;
+            opencv::core::rotate(
+                &frame,
+                &mut rotated_frame,
+                opencv::core::ROTATE_90_CLOCKWISE,
+            )
+            .unwrap();
+            frame = rotated_frame;
+        }
+
+        // Parse Row Data
         if let Some(row) = rows.front() {
-            let row = row.as_ref().expect("Invalid card data");
+            let row = row.as_ref().expect("Invalid row data");
             let time = TimeTick::build(row.sec, row.milli);
             // Card time just passed
             if time <= time_tick {
-                display_card.push_back(rows.pop_front().unwrap().unwrap());
+                let row = rows.pop_front().unwrap().unwrap();
+                if row.update_type.trim() == CARD_DATA_TYPE {
+                    display_card.push_back(row);
+                } else {
+                    if let Some(life) = row.player1_life {
+                        player1_life = life;
+                    }
+                    if let Some(life) = row.player2_life {
+                        player2_life = life;
+                    }
+                }
             }
         }
 
@@ -224,17 +400,17 @@ fn main() -> Result<(), Error> {
         if let (Some(card), None) = (display_card.front(), display_start_time) {
             display_start_time = Some(time_tick.clone());
             println!("{}", card.name);
-            card_db.load_card_image(&card.uuid, &image_file);
+            card_db.load_card_image(&card.name, &card.pitch, &image_file);
         }
 
         // Display card
         if let (Some(_), Some(start_time)) = (&display_card.front(), &display_start_time) {
-            if (time_tick - *start_time).as_f64() <= cfg.display_duration {
+            if (time_tick - *start_time).as_f64() <= DISPLAY_DURATION {
                 let elapsed_time = (time_tick - *start_time).as_f64();
                 let fade_stage = {
-                    if elapsed_time < cfg.fade_in_duration {
+                    if elapsed_time < FADE_IN_DURATION {
                         FadeStage::IN
-                    } else if elapsed_time < cfg.display_duration - cfg.fade_out_duration {
+                    } else if elapsed_time < DISPLAY_DURATION - FADE_OUT_DURATION {
                         FadeStage::DISPLAY
                     } else {
                         FadeStage::OUT
@@ -246,36 +422,34 @@ fn main() -> Result<(), Error> {
                 opencv::imgproc::resize(
                     &card_image.clone(),
                     &mut card_image,
-                    Size::new(CARD_WIDTH, CARD_HEIGHT),
+                    Size::new(card_width, card_height),
                     0.0,
                     0.0,
                     opencv::imgproc::INTER_LINEAR,
                 )?;
-                let card_size = card_image.size()?;
 
-                let x_offset = (frame_width as i32) - card_size.width - 20;
-                let y_offset = 20;
+                let y_offset = 4 * scoreboard_height_buffer + 3 * (scoreboard_height / 6);
                 let new_frame = frame.clone();
+
                 let roi = new_frame.roi(core::Rect::new(
-                    x_offset,
+                    scoreboard_width_buffer,
                     y_offset,
-                    card_size.width,
-                    card_size.height,
+                    card_width,
+                    card_height,
                 ))?;
 
                 let mut inner_roi = frame.roi_mut(core::Rect::new(
-                    x_offset,
+                    scoreboard_width_buffer,
                     y_offset,
-                    card_size.width,
-                    card_size.height,
+                    card_width,
+                    card_height,
                 ))?;
 
                 let alpha = match fade_stage {
-                    FadeStage::IN => cfg.max_transparency * (elapsed_time / cfg.fade_in_duration),
-                    FadeStage::DISPLAY => cfg.max_transparency,
+                    FadeStage::IN => MAX_TRANSPARENCY * (elapsed_time / FADE_IN_DURATION),
+                    FadeStage::DISPLAY => MAX_TRANSPARENCY,
                     FadeStage::OUT => {
-                        cfg.max_transparency
-                            * ((cfg.display_duration - elapsed_time) / cfg.fade_out_duration)
+                        MAX_TRANSPARENCY * ((DISPLAY_DURATION - elapsed_time) / FADE_OUT_DURATION)
                     }
                 };
 
