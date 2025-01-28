@@ -20,8 +20,12 @@ impl CardDB {
         for row in reader.into_records() {
             let row = row.unwrap();
             let name = row[headers["Card Name"]].to_string();
-            let set_id = row[headers["Card ID"]].to_string();
-            if set_id.starts_with("1HP") || set_id.starts_with("FAB") {
+            let set = row[headers["Set ID"]].to_string();
+            if set.starts_with("1HP") || set.starts_with("FAB") {
+                continue;
+            }
+            let art_variations = row[headers["Art Variations"]].to_string();
+            if !art_variations.trim().is_empty() {
                 continue;
             }
             let pitch = row[headers["Card Pitch"]].parse::<u32>().ok();

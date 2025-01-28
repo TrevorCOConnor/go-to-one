@@ -18,6 +18,7 @@ use textwrap::Options;
 const MAX_TRANSPARENCY: f64 = 0.8;
 const FADE_IN_DURATION: f64 = 0.75;
 const DISPLAY_DURATION: f64 = 6.0;
+const EXTENDED_DISPLAY_DURATION: f64 = 12.0;
 const FADE_OUT_DURATION: f64 = 0.75;
 
 // Constants
@@ -141,7 +142,7 @@ impl PartialOrd for TimeTick {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum FadeStage {
     IN,
     DISPLAY,
@@ -211,6 +212,7 @@ fn main() -> Result<(), Error> {
 
     // Set init vars
     let mut display_start_time = None;
+    let mut fade_start_time: Option<TimeTick> = None;
     let mut time_tick = TimeTick::new();
     let mut display_card: VecDeque<DataRow> = VecDeque::new();
     let image_file = tempfile(".png").unwrap();
@@ -405,17 +407,32 @@ fn main() -> Result<(), Error> {
 
         // Display card
         if let (Some(_), Some(start_time)) = (&display_card.front(), &display_start_time) {
-            if (time_tick - *start_time).as_f64() <= DISPLAY_DURATION {
-                let elapsed_time = (time_tick - *start_time).as_f64();
+            let elapsed_time = (time_tick - *start_time).as_f64();
+            if elapsed_time <= EXTENDED_DISPLAY_DURATION
+                && fade_start_time.is_none_or(|v| (time_tick - v).as_f64() < FADE_OUT_DURATION)
+            {
                 let fade_stage = {
+                    // Fade in
                     if elapsed_time < FADE_IN_DURATION {
                         FadeStage::IN
+                    // Minimum Display time
                     } else if elapsed_time < DISPLAY_DURATION - FADE_OUT_DURATION {
                         FadeStage::DISPLAY
+                    // Extended display
+                    } else if elapsed_time < EXTENDED_DISPLAY_DURATION - FADE_OUT_DURATION
+                        && display_card.len() == 1
+                    {
+                        FadeStage::DISPLAY
+                    // Fade out
                     } else {
                         FadeStage::OUT
                     }
                 };
+
+                // Start fade out timer if not started yet
+                if fade_stage == FadeStage::OUT && fade_start_time.is_none() {
+                    let _ = fade_start_time.insert(time_tick.clone());
+                }
 
                 let mut card_image =
                     imgcodecs::imread(&image_file, imgcodecs::IMREAD_COLOR).unwrap();
@@ -449,7 +466,9 @@ fn main() -> Result<(), Error> {
                     FadeStage::IN => MAX_TRANSPARENCY * (elapsed_time / FADE_IN_DURATION),
                     FadeStage::DISPLAY => MAX_TRANSPARENCY,
                     FadeStage::OUT => {
-                        MAX_TRANSPARENCY * ((DISPLAY_DURATION - elapsed_time) / FADE_OUT_DURATION)
+                        MAX_TRANSPARENCY
+                            * (1.0 - ((time_tick - fade_start_time.unwrap()).as_f64()
+                                / FADE_OUT_DURATION))
                     }
                 };
 
@@ -462,21 +481,10 @@ fn main() -> Result<(), Error> {
                     &mut inner_roi,
                     -1,
                 )?;
-
-                // put_text(
-                //     &mut frame,
-                //     name,
-                //     Point::new(x_offset, y_offset - 10),
-                //     FONT_HERSHEY_COMPLEX,
-                //     0.5,
-                //     Scalar::new(255.0, 255.0, 255.0, 0.0),
-                //     2,
-                //     LINE_AA,
-                //     false,
-                // )?;
             } else {
                 display_card.pop_front();
                 display_start_time = None;
+                fade_start_time = None;
             }
         }
 

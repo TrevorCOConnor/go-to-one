@@ -2,6 +2,7 @@ mod autocomplete;
 mod card_db;
 
 use chrono;
+use csv::StringRecord;
 use std::{
     collections::VecDeque,
     fs::File,
@@ -24,6 +25,43 @@ use crate::{
     autocomplete::autocomplete_card_name,
     card_db::{CardDB, CardData},
 };
+
+#[derive(Debug)]
+struct TimeTick {
+    sec: u64,
+    milli: f64,
+}
+
+impl TimeTick {
+    fn scale(&self, scalar: f64) -> Self {
+        let new_milli = self.milli * scalar;
+        let overflow = new_milli.div_euclid(MILLI);
+        let new_sec = (self.sec as f64) * scalar + overflow;
+        let new_milli = new_milli.rem_euclid(MILLI);
+
+        TimeTick {
+            sec: new_sec as u64,
+            milli: new_milli,
+        }
+    }
+
+    fn offset(&self, offset: f64) -> Self {
+        let _offset = offset * MILLI;
+
+        let sec_offset = _offset.div_euclid(MILLI);
+        let milli_offset = _offset.rem_euclid(MILLI);
+
+        let new_sec = (self.sec as f64) + sec_offset;
+        let new_milli = self.milli + milli_offset;
+
+        TimeTick {
+            sec: new_sec as u64,
+            milli: new_milli,
+        }
+    }
+}
+
+const MILLI: f64 = 1000.0;
 
 fn is_command(text: &str) -> bool {
     text.starts_with(":")
@@ -125,7 +163,8 @@ async fn print_events(
                                         text.pop();
                                     },
                                     KeyCode::Enter => {
-                                        let split: Vec<&str> = text.split(" ").collect();
+                                        let t_clone = text.clone();
+                                        let split: Vec<&str> = t_clone.split(" ").collect();
                                         if split.len() == 2 {
                                             let player = split[0];
                                             let life = split[1];
@@ -139,10 +178,10 @@ async fn print_events(
 
                                                 let (player1, player2) = {
                                                     if player == "-1" {
-                                                        println!("Player 1's life set to {}", life);
+                                                        text = format!("Player 1's life set to {}", life);
                                                         (Some(life), None)
                                                     } else {
-                                                        println!("Player 2's life set to {}", life);
+                                                        text = format!("Player 2's life set to {}", life);
                                                         (None, Some(life))
                                                     }
                                                 };
@@ -151,7 +190,7 @@ async fn print_events(
                                                     output_file,
                                                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                                                     time_stamp.as_secs(),
-                                                    time_stamp.as_millis(),
+                                                    time_stamp.as_millis().rem_euclid(MILLI as u128),
                                                     "",
                                                     "",
                                                     "",
@@ -196,7 +235,7 @@ async fn print_events(
                                                 output_file,
                                                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                                                 time_stamp.as_secs(),
-                                                time_stamp.as_millis(),
+                                                time_stamp.as_millis().rem_euclid(MILLI as u128),
                                                 suggest.uuid,
                                                 suggest.name,
                                                 suggest.pitch_str(),
@@ -243,13 +282,72 @@ async fn print_events(
     }
 }
 
+fn modify_time(input_fp: &str, output_fp: &str, scalar: Option<f64>, offset: Option<f64>) {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_path(input_fp)
+        .expect("Could not load card file");
+
+    let headers = reader.headers().unwrap().clone();
+
+    let records: Vec<Result<StringRecord, _>> = reader.into_records().collect();
+
+    let mut wtr = csv::WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(output_fp)
+        .unwrap();
+
+    let _ = wtr.write_record(&headers);
+
+    for record in records {
+        let record = record.unwrap();
+        let sec = record[0].parse::<u64>().expect("Sec invalid");
+        let milli = record[1].parse::<f64>().expect("Milli invalid");
+
+        let mut time_tick = TimeTick { sec, milli };
+        if let Some(sclr) = scalar {
+            time_tick = time_tick.scale(sclr);
+        }
+        if let Some(off) = offset {
+            time_tick = time_tick.offset(off)
+        }
+
+        let mut new_line = vec![time_tick.sec.to_string(), time_tick.milli.to_string()];
+        new_line.extend(record.iter().map(|v| v.to_string()).skip(2));
+
+        let _ = wtr.write_record(&new_line);
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
+    if args.len() < 3 {
         println!("Player name arguments missing");
         exit(0)
     }
+    if args[1] == "--modify" {
+        let input_fp = &args[2];
+        let output_fp = &args[3];
+        let mut scalar = None;
+        let mut offset = None;
+
+        for i in 0..=1 {
+            if args.len() >= 5 + 2 * i {
+                let modifier = &args[4 + (2 * i)];
+                println!("{}", modifier);
+                if modifier == "--scale" {
+                    scalar = args[5 + 2 * i].parse::<f64>().ok();
+                }
+                if modifier == "--offset" {
+                    offset = args[5 + 2 * i].parse::<f64>().ok();
+                }
+            }
+        }
+        modify_time(input_fp, output_fp, scalar, offset);
+        exit(0);
+    }
+
     let player1 = args[1].to_string();
     let player2 = args[2].to_string();
     let mut player_life = None;
