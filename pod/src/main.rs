@@ -1,4 +1,5 @@
-use clap::Parser;
+use clap::{ArgAction, Parser};
+use log::{debug, LevelFilter};
 use opencv::{
     core::{self, tempfile, Mat, MatTrait, MatTraitConst, Point, Scalar, Size},
     imgcodecs,
@@ -11,7 +12,14 @@ use opencv::{
 };
 use pod::CardDB;
 use serde::Deserialize;
-use std::{borrow::BorrowMut, collections::VecDeque, ops::Sub};
+use simplelog::{Config, WriteLogger};
+use std::{
+    borrow::BorrowMut,
+    collections::VecDeque,
+    fs::File,
+    ops::{Add, Sub},
+    time,
+};
 use textwrap::Options;
 
 // Card display
@@ -21,7 +29,7 @@ const DISPLAY_DURATION: f64 = 6.0;
 const EXTENDED_DISPLAY_DURATION: f64 = 12.0;
 const FADE_OUT_DURATION: f64 = 0.75;
 
-// Constants
+// Misc Values
 const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
 const MILLI: f64 = 1_000.0;
 
@@ -50,6 +58,7 @@ const CARD_DATA_TYPE: &str = "card";
 // Logo
 const LOGO_FP: &str = "data/Fleshandblood_Medium_500.png";
 
+/// Schema for row in card data file
 #[derive(Deserialize, Debug)]
 struct DataRow {
     sec: u64,
@@ -61,6 +70,7 @@ struct DataRow {
     update_type: String,
 }
 
+/// All command line arguments
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -77,9 +87,16 @@ struct Cli {
     hero2: String,
 
     #[arg(short, long)]
-    timeout: Option<u64>,
+    timeout: Option<f64>,
+
+    #[arg(short, long)]
+    skip: Option<f64>,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    debug: bool,
 }
 
+/// Used to track time by increasing increments
 #[derive(Clone, Copy, Debug)]
 struct TimeTick {
     sec: u64,
@@ -92,7 +109,12 @@ impl TimeTick {
     }
 
     fn build(sec: u64, milli: f64) -> Self {
-        TimeTick { sec, milli }
+        let overflow = milli.div_euclid(MILLI) as u64;
+        let underflow = milli.rem_euclid(MILLI);
+        TimeTick {
+            sec: sec + overflow,
+            milli: underflow,
+        }
     }
 
     fn increment_milli(&mut self, increment: f64) {
@@ -105,6 +127,33 @@ impl TimeTick {
 
     fn as_f64(&self) -> f64 {
         self.sec as f64 + (self.milli / MILLI)
+    }
+
+    fn from_f64(time: f64) -> Self {
+        Self::build(time.floor() as u64, time.fract() * MILLI)
+    }
+
+    fn as_tuple(&self) -> (u64, f64) {
+        (self.sec, self.milli)
+    }
+}
+
+impl Add for TimeTick {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let (left_sec, left_milli) = self.as_tuple();
+        let (right_sec, right_milli) = rhs.as_tuple();
+        debug!(
+            "{}:{} + {}:{} = {}:{}",
+            left_sec,
+            left_milli,
+            right_sec,
+            right_milli,
+            left_sec + right_sec,
+            left_milli + right_milli
+        );
+        Self::build(left_sec + right_sec, left_milli + right_milli)
     }
 }
 
@@ -142,6 +191,7 @@ impl PartialOrd for TimeTick {
     }
 }
 
+/// Different stages of Fade for card displays
 #[derive(Debug, PartialEq, Eq)]
 enum FadeStage {
     IN,
@@ -153,6 +203,23 @@ fn main() -> Result<(), Error> {
     let args = Cli::parse();
     let hero = format!("{}\n vs\n{}", args.hero1, args.hero2);
 
+    // Log stuff
+    let log_start = time::Instant::now();
+    if args.debug {
+        WriteLogger::init(
+            LevelFilter::Debug,
+            Config::default(),
+            File::create("debug.log").unwrap(),
+        )
+        .unwrap();
+    }
+
+    // Get time to start and stop
+    let mut skip_time = args.skip.map(|t| TimeTick::from_f64(t));
+    let timeout = args
+        .timeout
+        .map(|t| TimeTick::from_f64(t) + skip_time.unwrap_or(TimeTick::new()));
+
     // Load game stats
     let mut rows: VecDeque<Result<DataRow, csv::Error>> = csv::ReaderBuilder::new()
         .delimiter(b'\t')
@@ -160,6 +227,19 @@ fn main() -> Result<(), Error> {
         .expect("Could not load card file")
         .deserialize()
         .collect();
+
+    // Drop row values that occurred before start time
+    // NOTE: This can cause weird issues if the start time is contained within a cards display
+    // period. This should be accounted for outside of the code
+    if let Some(skip) = skip_time {
+        let dropped = rows
+            .iter()
+            .take_while(|row| {
+                TimeTick::build(row.as_ref().unwrap().sec, row.as_ref().unwrap().milli) < skip
+            })
+            .count();
+        rows.drain(..dropped);
+    }
 
     let output_path = "output_video.mp4";
 
@@ -208,7 +288,9 @@ fn main() -> Result<(), Error> {
     )?;
 
     // Load card db
+    debug!("Loading Card DB: {:?}", log_start.elapsed());
     let card_db = CardDB::init();
+    debug!("Card DB Loaded: {:?}", log_start.elapsed());
 
     // Set init vars
     let mut display_start_time = None;
@@ -239,9 +321,12 @@ fn main() -> Result<(), Error> {
     let mut life_ticker = 0;
     let life_ticker_mod = (LIFE_TICK / increment) as u32;
 
+    debug!("Starting Frame Iteration: {:?}", log_start.elapsed());
     loop {
-        if let Some(sec) = args.timeout {
-            if time_tick.sec > sec {
+        // Check timeout
+        if let Some(timeout_tick) = timeout {
+            if time_tick > timeout_tick {
+                debug!("Timeout {:?}", time_tick);
                 break;
             }
         }
@@ -252,6 +337,16 @@ fn main() -> Result<(), Error> {
         // Grab frame
         if !cap.read(&mut frame).unwrap_or(false) {
             break;
+        }
+
+        // Check skip
+        if let Some(skip) = skip_time {
+            if time_tick <= skip {
+                continue;
+            } else {
+                skip_time.take();
+                debug!("Done skipping {:?}", time_tick)
+            }
         }
 
         // Draw Scoreboard
@@ -402,11 +497,14 @@ fn main() -> Result<(), Error> {
         if let (Some(card), None) = (display_card.front(), display_start_time) {
             display_start_time = Some(time_tick.clone());
             println!("{}", card.name);
+            debug!("Loading Card Image: {:?}", log_start.elapsed());
             card_db.load_card_image(&card.name, &card.pitch, &image_file);
+            debug!("Card Image Loaded: {:?}", log_start.elapsed());
         }
 
         // Display card
         if let (Some(_), Some(start_time)) = (&display_card.front(), &display_start_time) {
+            debug!("Displaying card: {:?}", log_start.elapsed());
             let elapsed_time = (time_tick - *start_time).as_f64();
             if elapsed_time <= EXTENDED_DISPLAY_DURATION
                 && fade_start_time.is_none_or(|v| (time_tick - v).as_f64() < FADE_OUT_DURATION)
@@ -434,6 +532,7 @@ fn main() -> Result<(), Error> {
                     let _ = fade_start_time.insert(time_tick.clone());
                 }
 
+                debug!("Resizing image {:?}", log_start.elapsed());
                 let mut card_image =
                     imgcodecs::imread(&image_file, imgcodecs::IMREAD_COLOR).unwrap();
                 opencv::imgproc::resize(
@@ -444,8 +543,11 @@ fn main() -> Result<(), Error> {
                     0.0,
                     opencv::imgproc::INTER_LINEAR,
                 )?;
+                debug!("Image resized {:?}", log_start.elapsed());
 
                 let y_offset = 4 * scoreboard_height_buffer + 3 * (scoreboard_height / 6);
+
+                debug!("Cloning frame {:?}", log_start.elapsed());
                 let new_frame = frame.clone();
 
                 let roi = new_frame.roi(core::Rect::new(
@@ -461,17 +563,20 @@ fn main() -> Result<(), Error> {
                     card_width,
                     card_height,
                 ))?;
+                debug!("Frame cloned {:?}", log_start.elapsed());
 
                 let alpha = match fade_stage {
                     FadeStage::IN => MAX_TRANSPARENCY * (elapsed_time / FADE_IN_DURATION),
                     FadeStage::DISPLAY => MAX_TRANSPARENCY,
                     FadeStage::OUT => {
                         MAX_TRANSPARENCY
-                            * (1.0 - ((time_tick - fade_start_time.unwrap()).as_f64()
-                                / FADE_OUT_DURATION))
+                            * (1.0
+                                - ((time_tick - fade_start_time.unwrap()).as_f64()
+                                    / FADE_OUT_DURATION))
                     }
                 };
 
+                debug!("adding weighted {:?}", log_start.elapsed());
                 core::add_weighted(
                     &roi,
                     1.0 - alpha,
@@ -481,14 +586,18 @@ fn main() -> Result<(), Error> {
                     &mut inner_roi,
                     -1,
                 )?;
+                debug!("weighted added {:?}", log_start.elapsed());
             } else {
                 display_card.pop_front();
                 display_start_time = None;
                 fade_start_time = None;
             }
+            debug!("Card displayed: {:?}", log_start.elapsed());
         }
 
+        debug!("writing frame {:?}", log_start.elapsed());
         out.write(&frame)?;
+        debug!("frame written {:?}", log_start.elapsed());
     }
 
     Ok(())
