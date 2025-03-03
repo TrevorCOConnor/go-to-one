@@ -1,0 +1,17 @@
+[package]
+name = "overlay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.30", features = ["derive"] }
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+csv = "1.3.1"
+futures = "0.3.31"
+log = "0.4.26"
+opencv = "0.94.2"
+serde = { version = "1.0.218", features = ["derive"] }
+textwrap = "0.16.1"
+tokio = { version = "1.43.0", features = ["full"] }
+lib = { path = "../lib" }
+chrono = "0.4.40"

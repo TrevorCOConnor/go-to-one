@@ -1,4 +1,9 @@
 use clap::Parser;
+use crossterm::{
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
+use lib::image::get_card_art;
 use opencv::{
     core::{self, tempfile, Mat, MatTrait, MatTraitConst, Point, Scalar, Size},
     imgcodecs,
@@ -7,11 +12,9 @@ use opencv::{
         self, VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst, VideoWriter,
         VideoWriterTrait,
     },
-    Error,
 };
-use pod::CardDB;
 use serde::Deserialize;
-use std::{borrow::BorrowMut, collections::VecDeque, ops::Sub};
+use std::{borrow::BorrowMut, collections::VecDeque, error, io::stdout, ops::Sub};
 use textwrap::Options;
 
 // Card display
@@ -23,6 +26,7 @@ const FADE_OUT_DURATION: f64 = 0.75;
 
 // Constants
 const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
+const CARD_HEIGHT_RATIO: f64 = 628.0 / 450.0;
 const MILLI: f64 = 1_000.0;
 
 // Scoreboard dimensions
@@ -40,6 +44,12 @@ const HERO_FONT_STYLE: i32 = FONT_HERSHEY_SIMPLEX;
 const HERO_FONT_WIDTH: i32 = 4;
 const HERO_TEXT_LENGTH: Options = Options::new(20);
 
+// Heros
+const HERO_OFFSET_RATIO: f64 = 1.0 / 128.0;
+const HERO_BORDER_THICKNESS: i32 = 20;
+const HERO_TURN_COLOR: Scalar = Scalar::new(0.0, 0.0, 255.0, 0.0);
+const HERO_DEF_COLOR: Scalar = Scalar::new(0.0, 0.0, 0.0, 0.0);
+
 // Life
 const LIFE_TICK: f64 = 250.0;
 
@@ -49,6 +59,12 @@ const CARD_DATA_TYPE: &str = "card";
 
 // Logo
 const LOGO_FP: &str = "data/Fleshandblood_Medium_500.png";
+
+// Debug FPS
+const DEBUG_FPS: f64 = 5.;
+
+// Change the alias to use `Box<dyn error::Error>`.
+type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
 
 #[derive(Deserialize, Debug)]
 struct DataRow {
@@ -70,14 +86,11 @@ struct Cli {
     #[arg(short, long)]
     card_file: String,
 
-    #[arg(long)]
-    hero1: String,
-
-    #[arg(long)]
-    hero2: String,
-
     #[arg(short, long)]
     timeout: Option<u64>,
+
+    #[arg(short, long, action)]
+    debug: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,25 +162,51 @@ enum FadeStage {
     OUT,
 }
 
-fn main() -> Result<(), Error> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Cli::parse();
-    let hero = format!("{}\n vs\n{}", args.hero1, args.hero2);
+
+    // Load card db
+    let card_db = lib::card::CardDB::init();
+    let card_image_db = lib::card::CardImageDB::init();
+    let heroes = card_db.heroes();
+
+    // Init user input
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout)?;
+
+    println!("Choose hero 1:");
+    let hero1 = lib::commands::enter_card(&heroes).await;
+    println!("Choose hero 2:");
+    let hero2 = lib::commands::enter_card(&heroes).await;
+
+    // End user input
+    disable_raw_mode()?;
 
     // Load game stats
-    let mut rows: VecDeque<Result<DataRow, csv::Error>> = csv::ReaderBuilder::new()
+    let mut rows: VecDeque<std::result::Result<DataRow, csv::Error>> = csv::ReaderBuilder::new()
         .delimiter(b'\t')
         .from_path(args.card_file)
         .expect("Could not load card file")
         .deserialize()
         .collect();
 
-    let output_path = "output_video.mp4";
+    let output_path = format!("output_videos/{}_output_video.mp4", chrono::Local::now());
 
     // Create capture
     let mut cap = VideoCapture::from_file(&args.video_file, videoio::CAP_ANY)?;
     let original_width = cap.get(videoio::CAP_PROP_FRAME_WIDTH)?;
     let original_height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)?;
-    let fps = cap.get(videoio::CAP_PROP_FPS)?;
+    let original_fps = cap.get(videoio::CAP_PROP_FPS)?;
+
+    let fps = {
+        if args.debug {
+            DEBUG_FPS
+        } else {
+            original_fps
+        }
+    };
 
     // Calculate Rotated Dimensions
     let rotate = original_width < original_height;
@@ -192,23 +231,39 @@ fn main() -> Result<(), Error> {
     let scoreboard_height_buffer = (frame_height * SCOREBOARD_HEIGHT_BUFFER_RATIO) as i32;
     let scoreboard_height = (frame_height as i32) - 5 * scoreboard_height_buffer;
 
+    // Get hero images
+    let hero1_image_file = tempfile(".png").unwrap();
+    let hero2_image_file = tempfile(".png").unwrap();
+
+    card_image_db
+        .load_card_image(&hero1.name, &None, hero1_image_file.as_str())
+        .await;
+    card_image_db
+        .load_card_image(&hero2.name, &None, hero2_image_file.as_str())
+        .await;
+    let hero_width = ((scoreboard_width as f64) * (3.0 / 4.0)) as i32;
+    let hero_length = (CARD_HEIGHT_RATIO * (hero_width as f64)) as i32;
+    let hero1_img = get_card_art(&hero1_image_file, hero_width, hero_length)
+        .expect("Could not load hero1 image");
+    let hero2_img = get_card_art(&hero2_image_file, hero_width, hero_length)
+        .expect("Could not load hero2 image");
+
+    let hero = format!("{}\n vs\n{}", hero1.name, hero2.name);
+
     // Card dimensions
     let card_height = scoreboard_height / 2;
     let card_width = ((card_height as f64) * CARD_WIDTH_RATIO) as i32;
 
-    let increment = fps.recip() * MILLI;
+    let increment = original_fps.recip() * MILLI;
 
     // Generate output video
     let mut out = VideoWriter::new(
-        output_path,
+        &output_path,
         VideoWriter::fourcc('m', 'p', '4', 'v').unwrap(),
         fps,
         Size::new(frame_width as i32, frame_height as i32),
         true,
     )?;
-
-    // Load card db
-    let card_db = CardDB::init();
 
     // Set init vars
     let mut display_start_time = None;
@@ -239,6 +294,10 @@ fn main() -> Result<(), Error> {
     let mut life_ticker = 0;
     let life_ticker_mod = (LIFE_TICK / increment) as u32;
 
+    let mut debug_tracker = 0_u32;
+    let debug_skip_count = (original_fps / fps) as u32;
+
+    // LOOP HERE
     loop {
         if let Some(sec) = args.timeout {
             if time_tick.sec > sec {
@@ -249,9 +308,24 @@ fn main() -> Result<(), Error> {
         let mut frame = Mat::default();
         time_tick.increment_milli(increment);
 
+        // Increment life ticker
+        life_ticker += 1;
+        life_ticker = life_ticker % life_ticker_mod;
+
         // Grab frame
         if !cap.read(&mut frame).unwrap_or(false) {
             break;
+        }
+
+        // Speed up debug runs
+        if args.debug {
+            // Skip frame
+            if debug_tracker < debug_skip_count {
+                debug_tracker += 1;
+                continue;
+            } else {
+                debug_tracker = 0;
+            }
         }
 
         // Draw Scoreboard
@@ -264,9 +338,45 @@ fn main() -> Result<(), Error> {
             0,
         );
 
-        // Increment life ticker
-        life_ticker += 1;
-        life_ticker = life_ticker % life_ticker_mod;
+        // Heroes
+        let hero_x_offset = (HERO_OFFSET_RATIO * frame_width) as i32;
+        let hero_y_offset = (HERO_OFFSET_RATIO * frame_height) as i32;
+
+        // Draw hero1
+        let hero1_rect = core::Rect::new(
+            scoreboard_width + hero_x_offset,
+            (frame_height as i32) - hero1_img.rows() - hero_y_offset,
+            hero1_img.cols(),
+            hero1_img.rows(),
+        );
+        let mut hero1_roi = frame.roi_mut(hero1_rect)?;
+        let _ = hero1_img.copy_to(hero1_roi.borrow_mut());
+        imgproc::rectangle(
+            &mut frame,
+            hero1_rect,
+            HERO_DEF_COLOR,
+            HERO_BORDER_THICKNESS,
+            imgproc::LINE_8,
+            0,
+        )?;
+
+        // Draw hero2
+        let hero2_rect = core::Rect::new(
+            (frame_width as i32) - hero2_img.cols() - hero_y_offset,
+            hero_y_offset,
+            hero2_img.cols(),
+            hero2_img.rows(),
+        );
+        let mut hero2_roi = frame.roi_mut(hero2_rect)?;
+        let _ = hero2_img.copy_to(hero2_roi.borrow_mut());
+        imgproc::rectangle(
+            &mut frame,
+            hero2_rect,
+            HERO_DEF_COLOR,
+            HERO_BORDER_THICKNESS,
+            imgproc::LINE_8,
+            0,
+        )?;
 
         // Update life totals
         if life_ticker == 0 {
@@ -402,7 +512,9 @@ fn main() -> Result<(), Error> {
         if let (Some(card), None) = (display_card.front(), display_start_time) {
             display_start_time = Some(time_tick.clone());
             println!("{}", card.name);
-            card_db.load_card_image(&card.name, &card.pitch, &image_file);
+            card_image_db
+                .load_card_image(&card.name, &card.pitch, &image_file)
+                .await;
         }
 
         // Display card
@@ -467,8 +579,14 @@ fn main() -> Result<(), Error> {
                     FadeStage::DISPLAY => MAX_TRANSPARENCY,
                     FadeStage::OUT => {
                         MAX_TRANSPARENCY
+<<<<<<< HEAD:pod/src/main.rs
                             * (1.0 - ((time_tick - fade_start_time.unwrap()).as_f64()
                                 / FADE_OUT_DURATION))
+=======
+                            * (1.0
+                                - ((time_tick - fade_start_time.unwrap()).as_f64()
+                                    / FADE_OUT_DURATION))
+>>>>>>> merged:overlay/src/main.rs
                     }
                 };
 
