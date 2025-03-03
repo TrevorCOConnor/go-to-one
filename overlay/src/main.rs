@@ -3,6 +3,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use lib::image::get_card_art;
 use opencv::{
     core::{self, tempfile, Mat, MatTrait, MatTraitConst, Point, Scalar, Size},
     imgcodecs,
@@ -25,6 +26,7 @@ const FADE_OUT_DURATION: f64 = 0.75;
 
 // Constants
 const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
+const CARD_HEIGHT_RATIO: f64 = 628.0 / 450.0;
 const MILLI: f64 = 1_000.0;
 
 // Scoreboard dimensions
@@ -41,6 +43,12 @@ const HERO_FONT_SCALE: f64 = 2.0;
 const HERO_FONT_STYLE: i32 = FONT_HERSHEY_SIMPLEX;
 const HERO_FONT_WIDTH: i32 = 4;
 const HERO_TEXT_LENGTH: Options = Options::new(20);
+
+// Heros
+const HERO_OFFSET_RATIO: f64 = 1.0 / 128.0;
+const HERO_BORDER_THICKNESS: i32 = 20;
+const HERO_TURN_COLOR: Scalar = Scalar::new(0.0, 0.0, 255.0, 0.0);
+const HERO_DEF_COLOR: Scalar = Scalar::new(0.0, 0.0, 0.0, 0.0);
 
 // Life
 const LIFE_TICK: f64 = 250.0;
@@ -176,8 +184,6 @@ async fn main() -> Result<()> {
     // End user input
     disable_raw_mode()?;
 
-    let hero = format!("{}\n vs\n{}", hero1.name, hero2.name);
-
     // Load game stats
     let mut rows: VecDeque<std::result::Result<DataRow, csv::Error>> = csv::ReaderBuilder::new()
         .delimiter(b'\t')
@@ -225,6 +231,25 @@ async fn main() -> Result<()> {
     let scoreboard_height_buffer = (frame_height * SCOREBOARD_HEIGHT_BUFFER_RATIO) as i32;
     let scoreboard_height = (frame_height as i32) - 5 * scoreboard_height_buffer;
 
+    // Get hero images
+    let hero1_image_file = tempfile(".png").unwrap();
+    let hero2_image_file = tempfile(".png").unwrap();
+
+    card_image_db
+        .load_card_image(&hero1.name, &None, hero1_image_file.as_str())
+        .await;
+    card_image_db
+        .load_card_image(&hero2.name, &None, hero2_image_file.as_str())
+        .await;
+    let hero_width = ((scoreboard_width as f64) * (3.0 / 4.0)) as i32;
+    let hero_length = (CARD_HEIGHT_RATIO * (hero_width as f64)) as i32;
+    let hero1_img = get_card_art(&hero1_image_file, hero_width, hero_length)
+        .expect("Could not load hero1 image");
+    let hero2_img = get_card_art(&hero2_image_file, hero_width, hero_length)
+        .expect("Could not load hero2 image");
+
+    let hero = format!("{}\n vs\n{}", hero1.name, hero2.name);
+
     // Card dimensions
     let card_height = scoreboard_height / 2;
     let card_width = ((card_height as f64) * CARD_WIDTH_RATIO) as i32;
@@ -233,7 +258,7 @@ async fn main() -> Result<()> {
 
     // Generate output video
     let mut out = VideoWriter::new(
-        output_path,
+        &output_path,
         VideoWriter::fourcc('m', 'p', '4', 'v').unwrap(),
         fps,
         Size::new(frame_width as i32, frame_height as i32),
@@ -312,6 +337,46 @@ async fn main() -> Result<()> {
             LINE_8,
             0,
         );
+
+        // Heroes
+        let hero_x_offset = (HERO_OFFSET_RATIO * frame_width) as i32;
+        let hero_y_offset = (HERO_OFFSET_RATIO * frame_height) as i32;
+
+        // Draw hero1
+        let hero1_rect = core::Rect::new(
+            scoreboard_width + hero_x_offset,
+            (frame_height as i32) - hero1_img.rows() - hero_y_offset,
+            hero1_img.cols(),
+            hero1_img.rows(),
+        );
+        let mut hero1_roi = frame.roi_mut(hero1_rect)?;
+        let _ = hero1_img.copy_to(hero1_roi.borrow_mut());
+        imgproc::rectangle(
+            &mut frame,
+            hero1_rect,
+            HERO_DEF_COLOR,
+            HERO_BORDER_THICKNESS,
+            imgproc::LINE_8,
+            0,
+        )?;
+
+        // Draw hero2
+        let hero2_rect = core::Rect::new(
+            (frame_width as i32) - hero2_img.cols() - hero_y_offset,
+            hero_y_offset,
+            hero2_img.cols(),
+            hero2_img.rows(),
+        );
+        let mut hero2_roi = frame.roi_mut(hero2_rect)?;
+        let _ = hero2_img.copy_to(hero2_roi.borrow_mut());
+        imgproc::rectangle(
+            &mut frame,
+            hero2_rect,
+            HERO_DEF_COLOR,
+            HERO_BORDER_THICKNESS,
+            imgproc::LINE_8,
+            0,
+        )?;
 
         // Update life totals
         if life_ticker == 0 {
