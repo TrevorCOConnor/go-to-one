@@ -2,10 +2,7 @@ use clap::Parser;
 
 use lib::image::get_card_art;
 use opencv::{
-    core::{
-        self, tempfile, MatTraitConst, Point, Scalar, Size, UMat, UMatTrait, UMatTraitConst,
-        CV_8UC3,
-    },
+    core::{self, tempfile, MatTraitConst, Point, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
     imgcodecs,
     imgproc::{
         self, get_text_size, put_text, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX, LINE_8,
@@ -20,7 +17,7 @@ use serde::Deserialize;
 use std::{borrow::BorrowMut, collections::VecDeque, error, ops::Sub};
 
 // Card display
-const MAX_TRANSPARENCY: f64 = 0.8;
+const MAX_TRANSPARENCY: f64 = 1.0;
 const FADE_IN_DURATION: f64 = 0.75;
 const DISPLAY_DURATION: f64 = 6.0;
 const EXTENDED_DISPLAY_DURATION: f64 = 12.0;
@@ -29,8 +26,11 @@ const FADE_OUT_DURATION: f64 = 0.75;
 // Constants
 const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
 const CARD_HEIGHT_RATIO: f64 = 628.0 / 450.0;
-const CARD_BORDER_WIDTH: i32 = 20;
+const CARD_BORDER_WIDTH: i32 = 10;
 const MILLI: f64 = 1_000.0;
+
+// Background
+const BACKGROUND_ANIM_FILE: &'static str = "data/05ab24246ec26614fa27106953bbf7fcaa83ebae.gif";
 
 // Frame dimensions
 const FRAME_WIDTH_RATIO: f64 = 1.0 - (1.0 / 64.0);
@@ -64,7 +64,7 @@ const CARD_DATA_TYPE: &str = "card";
 const TURN_DATA_TYPE: &str = "turn";
 
 // Logo
-const LOGO_FP: &str = "data/gotoone-comic.png";
+const LOGO_FP: &str = "data/image.png";
 
 // Debug FPS
 const DEBUG_FPS: f64 = 5.;
@@ -241,6 +241,9 @@ fn main() -> Result<()> {
     let original_height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)?;
     let original_fps = cap.get(videoio::CAP_PROP_FPS)?;
 
+    // Create background capture
+    let mut background_cap = VideoCapture::from_file(BACKGROUND_ANIM_FILE, videoio::CAP_ANY)?;
+
     let font_scale = { original_width / 1920.0 };
     let fps = {
         if args.debug {
@@ -271,7 +274,7 @@ fn main() -> Result<()> {
     let scoreboard_width = (frame_width * SCOREBOARD_WIDTH_RATIO) as i32;
     let scoreboard_width_buffer = (frame_width * SCOREBOARD_WIDTH_BUFFER_RATIO) as i32;
     let scoreboard_height_buffer = (frame_height * SCOREBOARD_HEIGHT_BUFFER_RATIO) as i32;
-    let scoreboard_height = (frame_height as i32) - 2 * scoreboard_height_buffer;
+    let scoreboard_height = (frame_height as i32) - 5 * scoreboard_height_buffer;
 
     // Innerframe dimensions
     let innerframe_width = ((frame_width - scoreboard_width as f64) * FRAME_WIDTH_RATIO) as i32;
@@ -351,21 +354,37 @@ fn main() -> Result<()> {
         }
 
         // Draw background
-        let mut background = UMat::new_rows_cols_with_default(
-            frame_height as i32,
-            frame_width as i32,
-            CV_8UC3, // 8-bit unsigned, 3 channels (BGR)
-            Scalar::new(0.0, 0.0, 0.0, 0.0),
-            core::UMatUsageFlags::USAGE_DEFAULT,
-        )?;
-        let _ = imgproc::rectangle(
+        // Hack, baby!
+        let mut background_frame = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+        if !background_cap.read(&mut background_frame).unwrap_or(false) {
+            background_cap = VideoCapture::from_file(BACKGROUND_ANIM_FILE, videoio::CAP_ANY)?;
+            background_cap.read(&mut background_frame).unwrap();
+        }
+
+        let mut background = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+        opencv::imgproc::resize(
+            &background_frame,
             &mut background,
-            core::Rect::new(0, 0, frame_width as i32, frame_height as i32),
-            Scalar::new(0.0, 0.0, 0.0, 0.0),
-            -1, // Thickness of -1 fills the rectangle completely
-            LINE_8,
-            0,
-        );
+            Size::new(frame_width as i32, frame_height as i32),
+            0.0,
+            0.0,
+            opencv::imgproc::INTER_AREA,
+        )?;
+        // let mut background = UMat::new_rows_cols_with_default(
+        //     frame_height as i32,
+        //     frame_width as i32,
+        //     CV_8UC3, // 8-bit unsigned, 3 channels (BGR)
+        //     Scalar::new(0.0, 0.0, 0.0, 0.0),
+        //     core::UMatUsageFlags::USAGE_DEFAULT,
+        // )?;
+        // let _ = imgproc::rectangle(
+        //     &mut background,
+        //     core::Rect::new(0, 0, frame_width as i32, frame_height as i32),
+        //     Scalar::new(0.0, 0.0, 0.0, 0.0),
+        //     -1, // Thickness of -1 fills the rectangle completely
+        //     LINE_8,
+        //     0,
+        // );
 
         // Crop frame
         let crop_left = ((args.crop_left.unwrap_or(0.0) / 100.0) * frame_width) as i32;
@@ -417,14 +436,14 @@ fn main() -> Result<()> {
         }
 
         // Draw Scoreboard
-        let _ = imgproc::rectangle(
-            &mut frame,
-            core::Rect::new(0, 0, scoreboard_width, frame_height as i32),
-            Scalar::new(0.0, 0.0, 0.0, 0.0),
-            -1, // Thickness of -1 fills the rectangle completely
-            LINE_8,
-            0,
-        );
+        // let _ = imgproc::rectangle(
+        //     &mut frame,
+        //     core::Rect::new(0, 0, scoreboard_width, frame_height as i32),
+        //     Scalar::new(0.0, 0.0, 0.0, 0.0),
+        //     -1, // Thickness of -1 fills the rectangle completely
+        //     LINE_8,
+        //     0,
+        // );
 
         // Heroes
         let hero_x_offset = (HERO_OFFSET_RATIO * frame_width) as i32;
@@ -625,7 +644,7 @@ fn main() -> Result<()> {
             &mut frame,
             logo_rect,
             Scalar::new(0., 0., 0., 0.),
-            2,
+            10,
             imgproc::LINE_8,
             0,
         )?;
@@ -753,14 +772,14 @@ fn main() -> Result<()> {
                 )?;
 
                 // Draw rectangle around card to eliminate white edges
-                let _ = imgproc::rectangle(
-                    &mut frame,
-                    core::Rect::new(scoreboard_width_buffer, y_offset, card_width, card_height),
-                    Scalar::new(0.0, 0.0, 0.0, 0.0),
-                    CARD_BORDER_WIDTH, // Thickness of -1 fills the rectangle completely
-                    LINE_8,
-                    0,
-                );
+                // let _ = imgproc::rectangle(
+                //     &mut frame,
+                //     core::Rect::new(scoreboard_width_buffer, y_offset, card_width, card_height),
+                //     Scalar::new(0.0, 0.0, 0.0, 0.0),
+                //     CARD_BORDER_WIDTH, // Thickness of -1 fills the rectangle completely
+                //     LINE_8,
+                //     0,
+                // );
             } else {
                 display_card.pop_front();
                 display_start_time = None;
