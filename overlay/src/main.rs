@@ -1,21 +1,20 @@
 use clap::Parser;
-use crossterm::{
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode},
-};
+
 use lib::image::get_card_art;
 use opencv::{
-    core::{self, tempfile, Mat, MatTrait, MatTraitConst, Point, Scalar, Size},
+    core::{self, tempfile, Mat, MatTrait, MatTraitConst, Point, Scalar, Size, CV_8UC3},
     imgcodecs,
-    imgproc::{self, put_text, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX, LINE_8, LINE_AA},
+    imgproc::{
+        self, get_text_size, put_text, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX, LINE_8,
+        LINE_AA,
+    },
     videoio::{
         self, VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst, VideoWriter,
         VideoWriterTrait,
     },
 };
 use serde::Deserialize;
-use std::{borrow::BorrowMut, collections::VecDeque, error, io::stdout, ops::Sub};
-use textwrap::Options;
+use std::{borrow::BorrowMut, collections::VecDeque, error, ops::Sub};
 
 // Card display
 const MAX_TRANSPARENCY: f64 = 0.8;
@@ -27,7 +26,11 @@ const FADE_OUT_DURATION: f64 = 0.75;
 // Constants
 const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
 const CARD_HEIGHT_RATIO: f64 = 628.0 / 450.0;
+const CARD_BORDER_WIDTH: i32 = 20;
 const MILLI: f64 = 1_000.0;
+
+// Frame dimensions
+const FRAME_WIDTH_RATIO: f64 = 1.0 - (2.0 / 32.0);
 
 // Scoreboard dimensions
 const SCOREBOARD_WIDTH_RATIO: f64 = 0.2;
@@ -35,30 +38,29 @@ const SCOREBOARD_HEIGHT_BUFFER_RATIO: f64 = 0.02;
 const SCOREBOARD_WIDTH_BUFFER_RATIO: f64 = 0.01;
 
 // Fonts
-const SCORE_FONT_SCALE: f64 = 7.0;
+const SCORE_FONT_SCALE: f64 = 3.5;
 const SCORE_FONT_STYLE: i32 = FONT_HERSHEY_SCRIPT_COMPLEX;
 const SCORE_FONT_WIDTH: i32 = 8;
 
-const HERO_FONT_SCALE: f64 = 2.0;
-const HERO_FONT_STYLE: i32 = FONT_HERSHEY_SIMPLEX;
-const HERO_FONT_WIDTH: i32 = 4;
-const HERO_TEXT_LENGTH: Options = Options::new(20);
+const TURN_FONT_SCALE: f64 = 2.0;
+const TURN_FONT_FACE: i32 = FONT_HERSHEY_SIMPLEX;
+const TURN_FONT_THICKNESS: i32 = 6;
 
 // Heros
-const HERO_OFFSET_RATIO: f64 = 1.0 / 128.0;
-const HERO_BORDER_THICKNESS: i32 = 20;
-const HERO_TURN_COLOR: Scalar = Scalar::new(0.0, 0.0, 255.0, 0.0);
+const HERO_OFFSET_RATIO: f64 = 1.0 / 256.0;
+const HERO_BORDER_THICKNESS: i32 = 10;
+const HERO_TURN_COLOR: Scalar = Scalar::new(0.0, 100.0, 255.0, 0.0);
 const HERO_DEF_COLOR: Scalar = Scalar::new(0.0, 0.0, 0.0, 0.0);
 
 // Life
 const LIFE_TICK: f64 = 250.0;
 
 // File Constants
-const LIFE_DATA_TYPE: &str = "life";
 const CARD_DATA_TYPE: &str = "card";
+const TURN_DATA_TYPE: &str = "turn";
 
 // Logo
-const LOGO_FP: &str = "data/Fleshandblood_Medium_500.png";
+const LOGO_FP: &str = "data/gotoone-comic.png";
 
 // Debug FPS
 const DEBUG_FPS: f64 = 5.;
@@ -162,27 +164,30 @@ enum FadeStage {
     OUT,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(PartialEq, Eq)]
+enum TurnPlayer {
+    One,
+    Two,
+}
+
+impl TurnPlayer {
+    fn swap_update(&mut self) {
+        match &self {
+            Self::One => {
+                *self = Self::Two;
+            }
+            _ => {
+                *self = Self::One;
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
     let args = Cli::parse();
 
     // Load card db
-    let card_db = lib::card::CardDB::init();
     let card_image_db = lib::card::CardImageDB::init();
-    let heroes = card_db.heroes();
-
-    // Init user input
-    enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout)?;
-
-    println!("Choose hero 1:");
-    let hero1 = lib::commands::enter_card(&heroes).await;
-    println!("Choose hero 2:");
-    let hero2 = lib::commands::enter_card(&heroes).await;
-
-    // End user input
-    disable_raw_mode()?;
 
     // Load game stats
     let mut rows: VecDeque<std::result::Result<DataRow, csv::Error>> = csv::ReaderBuilder::new()
@@ -192,6 +197,32 @@ async fn main() -> Result<()> {
         .deserialize()
         .collect();
 
+    let first_stats = rows
+        .pop_front()
+        .expect("Invalid card file")
+        .expect("Invalid row format");
+    let second_stats = rows
+        .pop_front()
+        .expect("Invalid card file")
+        .expect("Invalid row format");
+
+    let mut turn_player = {
+        if first_stats.player1_life.is_some() {
+            TurnPlayer::One
+        } else {
+            TurnPlayer::Two
+        }
+    };
+
+    let (hero1_stats, hero2_stats) = {
+        if turn_player == TurnPlayer::One {
+            (first_stats, second_stats)
+        } else {
+            (second_stats, first_stats)
+        }
+    };
+
+    // Create output
     let output_path = format!("output_videos/{}_output_video.mp4", chrono::Local::now());
 
     // Create capture
@@ -231,24 +262,27 @@ async fn main() -> Result<()> {
     let scoreboard_height_buffer = (frame_height * SCOREBOARD_HEIGHT_BUFFER_RATIO) as i32;
     let scoreboard_height = (frame_height as i32) - 5 * scoreboard_height_buffer;
 
+    // Innerframe dimensions
+    let original_ratio = frame_height / frame_width;
+    let innerframe_width = (frame_width * FRAME_WIDTH_RATIO) as i32;
+    let innerframe_height = ((innerframe_width as f64) * original_ratio) as i32;
+
     // Get hero images
     let hero1_image_file = tempfile(".png").unwrap();
     let hero2_image_file = tempfile(".png").unwrap();
 
-    card_image_db
-        .load_card_image(&hero1.name, &None, hero1_image_file.as_str())
-        .await;
-    card_image_db
-        .load_card_image(&hero2.name, &None, hero2_image_file.as_str())
-        .await;
-    let hero_width = ((scoreboard_width as f64) * (3.0 / 4.0)) as i32;
+    card_image_db.load_card_image(&hero1_stats.name, &None, hero1_image_file.as_str());
+    card_image_db.load_card_image(&hero2_stats.name, &None, hero2_image_file.as_str());
+
+    // let hero_width = ((scoreboard_width as f64) * (3.0 / 4.0)) as i32;
+    let hero_width = ((scoreboard_width as f64) * 0.5) as i32;
     let hero_length = (CARD_HEIGHT_RATIO * (hero_width as f64)) as i32;
     let hero1_img = get_card_art(&hero1_image_file, hero_width, hero_length)
         .expect("Could not load hero1 image");
     let hero2_img = get_card_art(&hero2_image_file, hero_width, hero_length)
         .expect("Could not load hero2 image");
 
-    let hero = format!("{}\n vs\n{}", hero1.name, hero2.name);
+    // let hero = format!("{}\n vs\n{}", hero1.name, hero2.name);
 
     // Card dimensions
     let card_height = scoreboard_height / 2;
@@ -272,22 +306,10 @@ async fn main() -> Result<()> {
     let mut display_card: VecDeque<DataRow> = VecDeque::new();
     let image_file = tempfile(".png").unwrap();
 
-    // Set default life
-    let mut player1_life: i32 = 40;
-    let mut player2_life: i32 = 40;
-
-    // Check for init lifes row
-    let first_row = &rows
-        .front()
-        .expect("Empty data file")
-        .as_ref()
-        .expect("Broken data found at first row");
-    if first_row.update_type == LIFE_DATA_TYPE {
-        player1_life = first_row.player1_life.unwrap_or(40);
-        player2_life = first_row.player2_life.unwrap_or(40);
-    }
-
     // Track what the players lives should be so we can tick them down
+    let mut player1_life: i32 = hero1_stats.player1_life.unwrap() as i32;
+    let mut player2_life: i32 = hero2_stats.player2_life.unwrap() as i32;
+
     let mut player1_display_life: i32 = player1_life;
     let mut player2_display_life: i32 = player2_life;
 
@@ -296,6 +318,8 @@ async fn main() -> Result<()> {
 
     let mut debug_tracker = 0_u32;
     let debug_skip_count = (original_fps / fps) as u32;
+
+    let mut turn_counter = 1_u32;
 
     // LOOP HERE
     loop {
@@ -316,6 +340,44 @@ async fn main() -> Result<()> {
         if !cap.read(&mut frame).unwrap_or(false) {
             break;
         }
+
+        // Draw background
+        let mut background = Mat::new_rows_cols_with_default(
+            frame_height as i32,
+            frame_width as i32,
+            CV_8UC3,                         // 8-bit unsigned, 3 channels (BGR)
+            Scalar::new(0.0, 0.0, 0.0, 0.0), // Black color
+        )?;
+        let _ = imgproc::rectangle(
+            &mut background,
+            core::Rect::new(0, 0, frame_width as i32, frame_height as i32),
+            Scalar::new(0.0, 0.0, 0.0, 0.0),
+            -1, // Thickness of -1 fills the rectangle completely
+            LINE_8,
+            0,
+        );
+
+        let mut innerframe = Mat::default();
+        // place frame in background
+
+        opencv::imgproc::resize(
+            &frame,
+            &mut innerframe,
+            Size::new(innerframe_width, innerframe_height),
+            0.0,
+            0.0,
+            opencv::imgproc::INTER_LINEAR,
+        )?;
+        let mut frame_roi = background.roi_mut(core::Rect::new(
+            ((frame_width as i32) - innerframe_width).div_euclid(2),
+            ((frame_height as i32) - innerframe_height).div_euclid(2),
+            innerframe_width,
+            innerframe_height,
+        ))?;
+        let _ = innerframe.copy_to(frame_roi.borrow_mut());
+
+        // quick fix
+        frame = background;
 
         // Speed up debug runs
         if args.debug {
@@ -340,39 +402,66 @@ async fn main() -> Result<()> {
 
         // Heroes
         let hero_x_offset = (HERO_OFFSET_RATIO * frame_width) as i32;
-        let hero_y_offset = (HERO_OFFSET_RATIO * frame_height) as i32;
+        // let hero_y_offset = (HERO_OFFSET_RATIO * frame_height) as i32;
 
         // Draw hero1
+        // let hero1_rect = core::Rect::new(
+        //     scoreboard_width + hero_x_offset,
+        //     (frame_height as i32) - hero1_img.rows() - hero_y_offset,
+        //     hero1_img.cols(),
+        //     hero1_img.rows(),
+        // );
         let hero1_rect = core::Rect::new(
-            scoreboard_width + hero_x_offset,
-            (frame_height as i32) - hero1_img.rows() - hero_y_offset,
+            hero_x_offset,
+            2 * (scoreboard_height / 6) + 3 * (scoreboard_height_buffer),
             hero1_img.cols(),
             hero1_img.rows(),
         );
         let mut hero1_roi = frame.roi_mut(hero1_rect)?;
         let _ = hero1_img.copy_to(hero1_roi.borrow_mut());
+        let hero1_color = {
+            if turn_player == TurnPlayer::One {
+                HERO_TURN_COLOR
+            } else {
+                HERO_DEF_COLOR
+            }
+        };
         imgproc::rectangle(
             &mut frame,
             hero1_rect,
-            HERO_DEF_COLOR,
+            hero1_color,
             HERO_BORDER_THICKNESS,
             imgproc::LINE_8,
             0,
         )?;
 
         // Draw hero2
+        // let hero2_rect = core::Rect::new(
+        //     (frame_width as i32) - hero2_img.cols() - hero_y_offset,
+        //     hero_y_offset,
+        //     hero2_img.cols(),
+        //     hero2_img.rows(),
+        // );
+
         let hero2_rect = core::Rect::new(
-            (frame_width as i32) - hero2_img.cols() - hero_y_offset,
-            hero_y_offset,
+            hero1_img.cols() + 2 * hero_x_offset,
+            2 * (scoreboard_height / 6) + 3 * (scoreboard_height_buffer),
             hero2_img.cols(),
             hero2_img.rows(),
         );
         let mut hero2_roi = frame.roi_mut(hero2_rect)?;
         let _ = hero2_img.copy_to(hero2_roi.borrow_mut());
+        let hero2_color = {
+            if turn_player == TurnPlayer::Two {
+                HERO_TURN_COLOR
+            } else {
+                HERO_DEF_COLOR
+            }
+        };
         imgproc::rectangle(
             &mut frame,
             hero2_rect,
-            HERO_DEF_COLOR,
+            hero2_color,
             HERO_BORDER_THICKNESS,
             imgproc::LINE_8,
             0,
@@ -388,13 +477,24 @@ async fn main() -> Result<()> {
             }
         }
 
+        let mut baseline = 0;
+        let text_size = get_text_size(
+            "40",
+            SCORE_FONT_STYLE,
+            SCORE_FONT_SCALE,
+            SCORE_FONT_WIDTH,
+            &mut baseline,
+        )?;
+        let text_offset =
+            (scoreboard_width.div_euclid(2) - (2 * scoreboard_width_buffer) - text_size.width)
+                .div_euclid(2);
         // Player1 Life
         put_text(
             &mut frame,
             &player1_display_life.to_string(),
             Point::new(
-                scoreboard_width_buffer,
-                scoreboard_height / 6 - scoreboard_height_buffer,
+                text_offset + scoreboard_width_buffer,
+                9 * (scoreboard_height / 24),
             ),
             SCORE_FONT_STYLE,
             SCORE_FONT_SCALE,
@@ -408,8 +508,8 @@ async fn main() -> Result<()> {
             &mut frame,
             &player2_display_life.to_string(),
             Point::new(
-                scoreboard_width / 2 + scoreboard_width_buffer,
-                scoreboard_height / 6 - scoreboard_height_buffer,
+                scoreboard_width / 2 + text_offset + scoreboard_width_buffer,
+                9 * (scoreboard_height / 24),
             ),
             SCORE_FONT_STYLE,
             SCORE_FONT_SCALE,
@@ -418,62 +518,91 @@ async fn main() -> Result<()> {
             LINE_AA,
             false,
         )?;
-        // Draw Line between player lives
+
+        // Draw line between player lives
         let _ = imgproc::line(
             &mut frame,
-            Point::new(scoreboard_width / 2, scoreboard_height_buffer),
             Point::new(
                 scoreboard_width / 2,
-                scoreboard_height_buffer + scoreboard_height / 6,
+                9 * (scoreboard_height / 24) - text_size.height,
             ),
+            Point::new(scoreboard_width / 2, 9 * (scoreboard_height / 24)),
             Scalar::new(255.0, 255.0, 255.0, 255.0),
             SCORE_FONT_WIDTH,
             LINE_AA,
             0,
         );
 
+        // Turn counter
+        let mut baseline = 0;
+        let text_size = get_text_size(
+            "Turn 10",
+            TURN_FONT_FACE,
+            TURN_FONT_SCALE,
+            TURN_FONT_THICKNESS,
+            &mut baseline,
+        )?;
+        let turn_counter_rect = core::Rect::new(
+            (frame_width as i32) - text_size.width - 2 * scoreboard_width_buffer,
+            0,
+            text_size.width + 2 * scoreboard_width_buffer,
+            text_size.height + 2 * scoreboard_height_buffer,
+        );
+
+        let _ = imgproc::rectangle(
+            &mut frame,
+            turn_counter_rect,
+            Scalar::new(0., 0., 0., 0.),
+            -1,
+            imgproc::LINE_8,
+            0,
+        );
+        let _ = put_text(
+            &mut frame,
+            &format!("Turn {}", turn_counter),
+            Point::new(
+                (frame_width as i32) - text_size.width - scoreboard_width_buffer,
+                text_size.height + scoreboard_height_buffer,
+            ),
+            TURN_FONT_FACE,
+            TURN_FONT_SCALE,
+            Scalar::new(255.0, 255.0, 255.0, 0.0),
+            TURN_FONT_THICKNESS,
+            LINE_AA,
+            false,
+        );
+
         // GoToOne Logo
         let mut logo_image = imgcodecs::imread(&LOGO_FP, imgcodecs::IMREAD_COLOR).unwrap();
+        let logo_ratio = logo_image.rows() as f32 / logo_image.cols() as f32;
+        let new_logo_height = 2 * (scoreboard_height / 6) - 2 * scoreboard_height_buffer;
+        let new_logo_width = ((new_logo_height as f32) * logo_ratio) as i32;
+        let logo_offset =
+            (scoreboard_width - new_logo_width - scoreboard_width_buffer).div_euclid(2);
         opencv::imgproc::resize(
             &logo_image.clone(),
             &mut logo_image,
-            Size::new(
-                scoreboard_width - 2 * scoreboard_width_buffer,
-                scoreboard_height / 6,
-            ),
+            Size::new(new_logo_width, new_logo_height),
             0.0,
             0.0,
             opencv::imgproc::INTER_LINEAR,
         )?;
-        let mut logo_roi = frame.roi_mut(core::Rect::new(
-            scoreboard_width_buffer,
-            2 * scoreboard_height_buffer + (scoreboard_height / 6),
-            scoreboard_width - 2 * scoreboard_width_buffer,
-            scoreboard_height / 6,
-        ))?;
+        let logo_rect = core::Rect::new(
+            logo_offset,
+            scoreboard_height_buffer,
+            new_logo_width,
+            new_logo_height,
+        );
+        let mut logo_roi = frame.roi_mut(logo_rect)?;
         let _ = logo_image.copy_to(logo_roi.borrow_mut());
-
-        // Hero names
-        let wrapped_hero = textwrap::wrap(&hero, HERO_TEXT_LENGTH);
-        for (e, line) in wrapped_hero.iter().enumerate() {
-            let e = e as i32;
-            put_text(
-                &mut frame,
-                line,
-                Point::new(
-                    scoreboard_width_buffer,
-                    2 * (scoreboard_height / 6)
-                        + 3 * (scoreboard_height_buffer)
-                        + ((e + 1) * (frame_height as i32 / 30)),
-                ),
-                HERO_FONT_STYLE,
-                HERO_FONT_SCALE,
-                Scalar::new(255.0, 255.0, 255.0, 0.0),
-                HERO_FONT_WIDTH,
-                LINE_AA,
-                false,
-            )?;
-        }
+        imgproc::rectangle(
+            &mut frame,
+            logo_rect,
+            Scalar::new(0., 0., 0., 0.),
+            2,
+            imgproc::LINE_8,
+            0,
+        )?;
 
         // Rotate frame if necessary
         if rotate {
@@ -497,6 +626,9 @@ async fn main() -> Result<()> {
                 let row = rows.pop_front().unwrap().unwrap();
                 if row.update_type.trim() == CARD_DATA_TYPE {
                     display_card.push_back(row);
+                } else if row.update_type == TURN_DATA_TYPE {
+                    turn_counter += 1;
+                    turn_player.swap_update();
                 } else {
                     if let Some(life) = row.player1_life {
                         player1_life = life;
@@ -512,9 +644,7 @@ async fn main() -> Result<()> {
         if let (Some(card), None) = (display_card.front(), display_start_time) {
             display_start_time = Some(time_tick.clone());
             println!("{}", card.name);
-            card_image_db
-                .load_card_image(&card.name, &card.pitch, &image_file)
-                .await;
+            card_image_db.load_card_image(&card.name, &card.pitch, &image_file);
         }
 
         // Display card
@@ -579,14 +709,9 @@ async fn main() -> Result<()> {
                     FadeStage::DISPLAY => MAX_TRANSPARENCY,
                     FadeStage::OUT => {
                         MAX_TRANSPARENCY
-<<<<<<< HEAD:pod/src/main.rs
-                            * (1.0 - ((time_tick - fade_start_time.unwrap()).as_f64()
-                                / FADE_OUT_DURATION))
-=======
                             * (1.0
                                 - ((time_tick - fade_start_time.unwrap()).as_f64()
                                     / FADE_OUT_DURATION))
->>>>>>> merged:overlay/src/main.rs
                     }
                 };
 
@@ -599,6 +724,16 @@ async fn main() -> Result<()> {
                     &mut inner_roi,
                     -1,
                 )?;
+
+                // Draw rectangle around card to eliminate white edges
+                let _ = imgproc::rectangle(
+                    &mut frame,
+                    core::Rect::new(scoreboard_width_buffer, y_offset, card_width, card_height),
+                    Scalar::new(0.0, 0.0, 0.0, 0.0),
+                    CARD_BORDER_WIDTH, // Thickness of -1 fills the rectangle completely
+                    LINE_8,
+                    0,
+                );
             } else {
                 display_card.pop_front();
                 display_start_time = None;

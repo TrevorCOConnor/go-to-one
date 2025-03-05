@@ -11,7 +11,7 @@ use crossterm::{
 use futures::{future::FutureExt, select, StreamExt};
 
 use crate::{
-    autocomplete::{get_user_input_for_autocomplete, AutocompleteResult},
+    autocomplete::{get_user_input_for_autocomplete, AutocompleteResult, Named},
     card::CardData,
 };
 
@@ -50,6 +50,60 @@ pub async fn enter_card<'a>(cards: &[&'a CardData]) -> &'a CardData {
                         let display = {
                             if let Some(suggest) = suggestions.front() {
                                 let split = suggest.display.split_at(text.len());
+                                &format!("{}{}", split.0, split.1.grey())
+                            } else {
+                                &text
+                            }
+                        };
+                        println!("> {}", display);
+                        let _ = execute!(stdout(), MoveUp(1));
+                    },
+                    Some(Err(e)) => println!("Error: {:?}\r", e),
+                    None => {},
+                }
+            }
+        }
+    }
+}
+
+pub async fn get_user_input<'a, T: Named>(options: &'a [T]) -> &'a T
+where
+    &'a T: Named,
+{
+    let mut reader = EventStream::new();
+    let mut text = String::new();
+    let mut suggestions = VecDeque::new();
+    println!("> ");
+    let _ = execute!(stdout(), MoveUp(1));
+    loop {
+        let mut event = reader.next().fuse();
+        select! {
+            maybe_event = event => {
+                match maybe_event {
+                    Some(Ok(event)) => {
+                        if let Event::Key(key) = event {
+                            let res = get_user_input_for_autocomplete(options, &text, &suggestions, key);
+                            match res {
+                                AutocompleteResult::Finished(option) => {
+                                    let pos = position().unwrap();
+                                    let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
+                                    println!("> {}", option.get_name());
+                                    let pos = position().unwrap();
+                                    let _  = execute!(stdout(), MoveTo(0, pos.1));
+                                    return option;
+                                }
+                                AutocompleteResult::Continue{text: new_text, suggestions: new_suggestions} => {
+                                    text = new_text;
+                                    suggestions = new_suggestions;
+                                }
+                            }
+                        }
+                        let pos = position().unwrap();
+                        let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
+
+                        let display = {
+                            if let Some(suggest) = suggestions.front() {
+                                let split = suggest.get_name().split_at(text.len());
                                 &format!("{}{}", split.0, split.1.grey())
                             } else {
                                 &text

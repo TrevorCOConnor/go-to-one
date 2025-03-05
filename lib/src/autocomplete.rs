@@ -41,8 +41,15 @@ pub fn get_user_input_for_autocomplete<'a, T: Named>(
     let mut new_suggestions = current_suggestions.clone();
     match key.code {
         KeyCode::Char(c) => {
+            // Add character to current text and update suggestions
             new_text.push(c);
             new_suggestions = VecDeque::from(autocomplete(values, &new_text));
+
+            // Ignore character if no matches
+            if new_suggestions.len() == 0 {
+                new_text = current_text.to_owned();
+                new_suggestions = current_suggestions.clone();
+            }
         }
         KeyCode::Backspace => {
             new_text.pop();
@@ -52,10 +59,14 @@ pub fn get_user_input_for_autocomplete<'a, T: Named>(
             new_suggestions = VecDeque::new()
         }
         KeyCode::BackTab => {
-            new_suggestions.rotate_right(1);
+            if new_suggestions.len() > 0 {
+                new_suggestions.rotate_right(1);
+            }
         }
         KeyCode::Tab => {
-            new_suggestions.rotate_left(1);
+            if new_suggestions.len() > 0 {
+                new_suggestions.rotate_left(1);
+            }
         }
         KeyCode::Enter => {
             if let Some(suggest) = new_suggestions.front() {
@@ -67,5 +78,29 @@ pub fn get_user_input_for_autocomplete<'a, T: Named>(
     AutocompleteResult::Continue {
         text: new_text,
         suggestions: new_suggestions,
+    }
+}
+
+pub struct AutocompleteOption(String);
+
+impl AutocompleteOption {
+    pub fn new(option: String) -> Self {
+        AutocompleteOption(option)
+    }
+
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Named for AutocompleteOption {
+    fn get_name(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Named for &AutocompleteOption {
+    fn get_name(&self) -> &str {
+        &self.0
     }
 }

@@ -13,6 +13,7 @@ const CARD_FILE: &'static str = "data/card.csv";
 pub struct CardData {
     pub name: String,
     pub pitch: Option<u32>,
+    pub life: Option<u32>,
     pub display: String,
     pub uuid: String,
     pub types: Vec<String>,
@@ -38,6 +39,7 @@ impl CardData {
         Some(CardData {
             name: name.clone(),
             pitch: record[headers["Pitch"]].parse::<u32>().ok(),
+            life: record[headers["Health"]].parse::<u32>().ok(),
             display: format!("{}{}", name, pitch),
             uuid: record[headers["Unique ID"]].to_string(),
             types: record
@@ -80,6 +82,13 @@ impl CardDB {
             .iter()
             .filter(|c| c.types.contains(&"hero".to_string()))
             .collect()
+    }
+
+    pub fn find(&self, name: &str, pitch: Option<u32>) -> Option<&CardData> {
+        self.cards
+            .iter()
+            .filter(|c| c.name == name && c.pitch == pitch)
+            .next()
     }
 }
 
@@ -128,11 +137,11 @@ impl CardImageDB {
     }
 
     /// This is almost certainly wrong
-    pub async fn load_card_image(&self, name: &str, pitch: &Option<u32>, fp: &str) {
+    pub fn load_card_image(&self, name: &str, pitch: &Option<u32>, fp: &str) {
         let url = &self.uuid_card_map[&(name.to_string(), pitch.to_owned())];
 
         let mut file = std::fs::File::create(fp).unwrap();
-        let bytes = reqwest::get(url).await.unwrap().bytes().await.unwrap();
+        let bytes = reqwest::blocking::get(url).unwrap().bytes().unwrap();
         let _ = file.write_all(&bytes);
     }
 }
