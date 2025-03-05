@@ -33,7 +33,8 @@ const CARD_BORDER_WIDTH: i32 = 20;
 const MILLI: f64 = 1_000.0;
 
 // Frame dimensions
-const FRAME_WIDTH_RATIO: f64 = 1.0 - (1.0 / 32.0);
+const FRAME_WIDTH_RATIO: f64 = 1.0 - (1.0 / 64.0);
+const FRAME_HEIGHT_RATIO: f64 = 1.0 - (1.0 / 64.0);
 
 // Scoreboard dimensions
 const SCOREBOARD_WIDTH_RATIO: f64 = 0.2;
@@ -51,7 +52,7 @@ const TURN_FONT_THICKNESS: i32 = 2;
 
 // Heros
 const HERO_OFFSET_RATIO: f64 = 1.0 / 256.0;
-const HERO_BORDER_THICKNESS: i32 = 10;
+const HERO_BORDER_THICKNESS: i32 = 5;
 const HERO_TURN_COLOR: Scalar = Scalar::new(0.0, 100.0, 255.0, 0.0);
 const HERO_DEF_COLOR: Scalar = Scalar::new(0.0, 0.0, 0.0, 0.0);
 
@@ -96,6 +97,12 @@ struct Cli {
 
     #[arg(short, long, action)]
     debug: bool,
+
+    #[arg(long)]
+    crop_left: Option<f64>,
+
+    #[arg(long)]
+    crop_right: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -267,9 +274,7 @@ fn main() -> Result<()> {
     let scoreboard_height = (frame_height as i32) - 2 * scoreboard_height_buffer;
 
     // Innerframe dimensions
-    let original_ratio = frame_height / frame_width;
     let innerframe_width = ((frame_width - scoreboard_width as f64) * FRAME_WIDTH_RATIO) as i32;
-    let innerframe_height = ((innerframe_width as f64) * original_ratio) as i32;
 
     // Get hero images
     let hero1_image_file = tempfile(".png").unwrap();
@@ -362,22 +367,38 @@ fn main() -> Result<()> {
             0,
         );
 
-        let mut innerframe = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-        // place frame in background
+        // Crop frame
+        let crop_left = ((args.crop_left.unwrap_or(0.0) / 100.0) * frame_width) as i32;
+        let crop_right = ((args.crop_right.unwrap_or(0.0) / 100.0) * frame_width) as i32;
+        let crop_roi = frame.roi(core::Rect::new(
+            crop_left,
+            0,
+            frame_width as i32 - (crop_left + crop_right),
+            (frame_height * FRAME_HEIGHT_RATIO) as i32,
+        ))?;
 
+        let new_ratio = crop_roi.cols() as f64 / crop_roi.rows() as f64;
+        let innerframe_height = std::cmp::min(
+            (innerframe_width as f64 * new_ratio.recip()) as i32,
+            (frame_height * FRAME_WIDTH_RATIO) as i32,
+        );
+        let innerframe_width = (new_ratio * innerframe_height as f64) as i32;
+
+        // place frame in background
+        let mut innerframe = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
         opencv::imgproc::resize(
-            &frame,
+            &crop_roi,
             &mut innerframe,
             Size::new(innerframe_width, innerframe_height),
             0.0,
             0.0,
-            opencv::imgproc::INTER_LINEAR,
+            opencv::imgproc::INTER_AREA,
         )?;
         let mut frame_roi = background.roi_mut(core::Rect::new(
             scoreboard_width,
-            ((frame_height as i32) - innerframe_height).div_euclid(2),
+            (frame_height as i32 - innerframe_height).div_euclid(2),
             innerframe_width,
-            innerframe_height,
+            innerframe_height as i32,
         ))?;
         let _ = innerframe.copy_to(frame_roi.borrow_mut());
 
@@ -610,6 +631,7 @@ fn main() -> Result<()> {
         )?;
 
         // Rotate frame if necessary
+        // MOVE THIS EARLIER
         if rotate {
             let mut rotated_frame = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
             core::transpose(&frame, &mut rotated_frame)?;
