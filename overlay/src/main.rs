@@ -2,7 +2,10 @@ use clap::Parser;
 
 use lib::image::get_card_art;
 use opencv::{
-    core::{self, tempfile, Mat, MatTrait, MatTraitConst, Point, Scalar, Size, CV_8UC3},
+    core::{
+        self, tempfile, MatTraitConst, Point, Scalar, Size, UMat, UMatTrait, UMatTraitConst,
+        CV_8UC3,
+    },
     imgcodecs,
     imgproc::{
         self, get_text_size, put_text, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX, LINE_8,
@@ -30,7 +33,7 @@ const CARD_BORDER_WIDTH: i32 = 20;
 const MILLI: f64 = 1_000.0;
 
 // Frame dimensions
-const FRAME_WIDTH_RATIO: f64 = 1.0 - (2.0 / 32.0);
+const FRAME_WIDTH_RATIO: f64 = 1.0 - (1.0 / 32.0);
 
 // Scoreboard dimensions
 const SCOREBOARD_WIDTH_RATIO: f64 = 0.2;
@@ -264,7 +267,7 @@ fn main() -> Result<()> {
 
     // Innerframe dimensions
     let original_ratio = frame_height / frame_width;
-    let innerframe_width = (frame_width * FRAME_WIDTH_RATIO) as i32;
+    let innerframe_width = ((frame_width - scoreboard_width as f64) * FRAME_WIDTH_RATIO) as i32;
     let innerframe_height = ((innerframe_width as f64) * original_ratio) as i32;
 
     // Get hero images
@@ -329,7 +332,7 @@ fn main() -> Result<()> {
             }
         }
 
-        let mut frame = Mat::default();
+        let mut frame = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
         time_tick.increment_milli(increment);
 
         // Increment life ticker
@@ -342,11 +345,12 @@ fn main() -> Result<()> {
         }
 
         // Draw background
-        let mut background = Mat::new_rows_cols_with_default(
+        let mut background = UMat::new_rows_cols_with_default(
             frame_height as i32,
             frame_width as i32,
-            CV_8UC3,                         // 8-bit unsigned, 3 channels (BGR)
-            Scalar::new(0.0, 0.0, 0.0, 0.0), // Black color
+            CV_8UC3, // 8-bit unsigned, 3 channels (BGR)
+            Scalar::new(0.0, 0.0, 0.0, 0.0),
+            core::UMatUsageFlags::USAGE_DEFAULT,
         )?;
         let _ = imgproc::rectangle(
             &mut background,
@@ -357,7 +361,7 @@ fn main() -> Result<()> {
             0,
         );
 
-        let mut innerframe = Mat::default();
+        let mut innerframe = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
         // place frame in background
 
         opencv::imgproc::resize(
@@ -369,7 +373,7 @@ fn main() -> Result<()> {
             opencv::imgproc::INTER_LINEAR,
         )?;
         let mut frame_roi = background.roi_mut(core::Rect::new(
-            ((frame_width as i32) - innerframe_width).div_euclid(2),
+            scoreboard_width,
             ((frame_height as i32) - innerframe_height).div_euclid(2),
             innerframe_width,
             innerframe_height,
@@ -606,7 +610,7 @@ fn main() -> Result<()> {
 
         // Rotate frame if necessary
         if rotate {
-            let mut rotated_frame = Mat::default();
+            let mut rotated_frame = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
             core::transpose(&frame, &mut rotated_frame)?;
             opencv::core::rotate(
                 &frame,
