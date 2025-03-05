@@ -41,13 +41,13 @@ const SCOREBOARD_HEIGHT_BUFFER_RATIO: f64 = 0.02;
 const SCOREBOARD_WIDTH_BUFFER_RATIO: f64 = 0.01;
 
 // Fonts
-const SCORE_FONT_SCALE: f64 = 3.5;
+const SCORE_FONT_SCALE: f64 = 1.75;
 const SCORE_FONT_STYLE: i32 = FONT_HERSHEY_SCRIPT_COMPLEX;
-const SCORE_FONT_WIDTH: i32 = 8;
+const SCORE_FONT_WIDTH: i32 = 3;
 
-const TURN_FONT_SCALE: f64 = 2.0;
+const TURN_FONT_SCALE: f64 = 1.0;
 const TURN_FONT_FACE: i32 = FONT_HERSHEY_SIMPLEX;
-const TURN_FONT_THICKNESS: i32 = 6;
+const TURN_FONT_THICKNESS: i32 = 2;
 
 // Heros
 const HERO_OFFSET_RATIO: f64 = 1.0 / 256.0;
@@ -234,6 +234,7 @@ fn main() -> Result<()> {
     let original_height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)?;
     let original_fps = cap.get(videoio::CAP_PROP_FPS)?;
 
+    let font_scale = { original_width / 1920.0 };
     let fps = {
         if args.debug {
             DEBUG_FPS
@@ -263,7 +264,7 @@ fn main() -> Result<()> {
     let scoreboard_width = (frame_width * SCOREBOARD_WIDTH_RATIO) as i32;
     let scoreboard_width_buffer = (frame_width * SCOREBOARD_WIDTH_BUFFER_RATIO) as i32;
     let scoreboard_height_buffer = (frame_height * SCOREBOARD_HEIGHT_BUFFER_RATIO) as i32;
-    let scoreboard_height = (frame_height as i32) - 5 * scoreboard_height_buffer;
+    let scoreboard_height = (frame_height as i32) - 2 * scoreboard_height_buffer;
 
     // Innerframe dimensions
     let original_ratio = frame_height / frame_width;
@@ -434,7 +435,7 @@ fn main() -> Result<()> {
             &mut frame,
             hero1_rect,
             hero1_color,
-            HERO_BORDER_THICKNESS,
+            HERO_BORDER_THICKNESS * font_scale as i32,
             imgproc::LINE_8,
             0,
         )?;
@@ -466,7 +467,7 @@ fn main() -> Result<()> {
             &mut frame,
             hero2_rect,
             hero2_color,
-            HERO_BORDER_THICKNESS,
+            HERO_BORDER_THICKNESS * font_scale as i32,
             imgproc::LINE_8,
             0,
         )?;
@@ -485,8 +486,8 @@ fn main() -> Result<()> {
         let text_size = get_text_size(
             "40",
             SCORE_FONT_STYLE,
-            SCORE_FONT_SCALE,
-            SCORE_FONT_WIDTH,
+            SCORE_FONT_SCALE * font_scale,
+            SCORE_FONT_WIDTH * font_scale as i32,
             &mut baseline,
         )?;
         let text_offset =
@@ -501,9 +502,9 @@ fn main() -> Result<()> {
                 9 * (scoreboard_height / 24),
             ),
             SCORE_FONT_STYLE,
-            SCORE_FONT_SCALE,
+            SCORE_FONT_SCALE * font_scale,
             Scalar::new(255.0, 255.0, 255.0, 0.0),
-            SCORE_FONT_WIDTH,
+            SCORE_FONT_WIDTH * font_scale as i32,
             LINE_AA,
             false,
         )?;
@@ -516,9 +517,9 @@ fn main() -> Result<()> {
                 9 * (scoreboard_height / 24),
             ),
             SCORE_FONT_STYLE,
-            SCORE_FONT_SCALE,
+            SCORE_FONT_SCALE * font_scale,
             Scalar::new(255.0, 255.0, 255.0, 0.0),
-            SCORE_FONT_WIDTH,
+            SCORE_FONT_WIDTH * font_scale as i32,
             LINE_AA,
             false,
         )?;
@@ -532,7 +533,7 @@ fn main() -> Result<()> {
             ),
             Point::new(scoreboard_width / 2, 9 * (scoreboard_height / 24)),
             Scalar::new(255.0, 255.0, 255.0, 255.0),
-            SCORE_FONT_WIDTH,
+            SCORE_FONT_WIDTH * font_scale as i32,
             LINE_AA,
             0,
         );
@@ -542,8 +543,8 @@ fn main() -> Result<()> {
         let text_size = get_text_size(
             "Turn 10",
             TURN_FONT_FACE,
-            TURN_FONT_SCALE,
-            TURN_FONT_THICKNESS,
+            TURN_FONT_SCALE * font_scale,
+            TURN_FONT_THICKNESS * font_scale as i32,
             &mut baseline,
         )?;
         let turn_counter_rect = core::Rect::new(
@@ -569,9 +570,9 @@ fn main() -> Result<()> {
                 text_size.height + scoreboard_height_buffer,
             ),
             TURN_FONT_FACE,
-            TURN_FONT_SCALE,
+            TURN_FONT_SCALE * font_scale,
             Scalar::new(255.0, 255.0, 255.0, 0.0),
-            TURN_FONT_THICKNESS,
+            TURN_FONT_THICKNESS * font_scale as i32,
             LINE_AA,
             false,
         );
