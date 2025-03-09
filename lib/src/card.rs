@@ -122,14 +122,17 @@ impl CardImageDB {
             let row = row.unwrap();
             let name = row[headers["Card Name"]].to_string();
             let set = row[headers["Set ID"]].to_string();
-            if set.starts_with("1HP") || set.starts_with("FAB") {
+            let pitch = row[headers["Card Pitch"]].parse::<u32>().ok();
+            // Skip HP1 and promo cards
+            if ["HP1", "FAB", "HER", "WIN"].contains(&&set[0..=2]) {
                 continue;
             }
             let art_variations = row[headers["Art Variations"]].to_string();
-            if !art_variations.trim().is_empty() {
+            // Skip art variations if possible
+            // Some cards only have art variations, though
+            if !art_variations.trim().is_empty() && map.contains_key(&(name.clone(), pitch)) {
                 continue;
             }
-            let pitch = row[headers["Card Pitch"]].parse::<u32>().ok();
             map.insert((name, pitch), row[headers["Image URL"]].to_string());
         }
 

@@ -1,5 +1,5 @@
 use opencv::{
-    core::{Mat, MatTraitConst, Rect, Size},
+    core::{MatTraitConst, Rect, Size, UMat, UMatTraitConst},
     imgcodecs, imgproc, Error,
 };
 
@@ -7,7 +7,7 @@ const ART_RATIO: f64 = 3.0 / 5.0;
 const BORDER_X_RATIO: f64 = 1.0 / 30.0;
 const BORDER_Y_RATIO: f64 = 1.0 / 36.0;
 
-pub fn get_card_art(image_fp: &str, card_width: i32, card_height: i32) -> Result<Mat, Error> {
+pub fn get_card_art(image_fp: &str, card_width: i32, card_height: i32) -> Result<UMat, Error> {
     // Load the image
     let img = imgcodecs::imread(image_fp, imgcodecs::IMREAD_COLOR)?;
 
@@ -16,7 +16,7 @@ pub fn get_card_art(image_fp: &str, card_width: i32, card_height: i32) -> Result
         panic!("Could not open or find the image!");
     }
     // Resize card to match frame ratio
-    let mut resized = Mat::default();
+    let mut resized = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
     imgproc::resize(
         &img,
         &mut resized,
@@ -38,9 +38,9 @@ pub fn get_card_art(image_fp: &str, card_width: i32, card_height: i32) -> Result
     );
 
     // Crop the image using the ROI
-    let mut cropped = Mat::default();
+    let mut cropped = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
     // let _ = Mat::roi(&img, roi)?.copy_to(&mut cropped)?;
-    Mat::roi(&resized, roi)?.copy_to(&mut cropped)?;
+    UMat::roi(&resized, roi)?.copy_to(&mut cropped)?;
 
     Ok(cropped)
 }

@@ -155,7 +155,7 @@ struct Record {
 
 impl Record {
     fn headers() -> String {
-        "sec\tmilli\tuuid\tname\tpitch\tplayer1_life\tplayer2_life\tupdate_type\n".to_string()
+        "sec\tmilli\tname\tpitch\tplayer1_life\tplayer2_life\tupdate_type\n".to_string()
     }
 
     fn text(self) -> String {
