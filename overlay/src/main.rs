@@ -180,21 +180,23 @@ enum FadeStage {
     OUT,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum TurnPlayer {
+    None,
     One,
     Two,
 }
 
 impl TurnPlayer {
-    fn swap_update(&mut self) {
+    fn swap_update(&mut self, default: &Self) {
         match &self {
             Self::One => {
                 *self = Self::Two;
             }
-            _ => {
+            Self::Two => {
                 *self = Self::One;
             }
+            Self::None => *self = default.clone(),
         }
     }
 }
@@ -222,7 +224,7 @@ fn main() -> Result<()> {
         .expect("Invalid card file")
         .expect("Invalid row format");
 
-    let mut turn_player = {
+    let first_turn_player = {
         if first_stats.player1_life.is_some() {
             TurnPlayer::One
         } else {
@@ -230,8 +232,10 @@ fn main() -> Result<()> {
         }
     };
 
+    let mut turn_player = TurnPlayer::None;
+
     let (hero1_stats, hero2_stats) = {
-        if turn_player == TurnPlayer::One {
+        if first_turn_player == TurnPlayer::One {
             (first_stats, second_stats)
         } else {
             (second_stats, first_stats)
@@ -645,13 +649,13 @@ fn main() -> Result<()> {
             &mut frame,
             logo_rect,
             Scalar::new(0., 0., 0., 0.),
-            10,
+            (HERO_BORDER_THICKNESS as f64 * 2.0 * font_scale) as i32,
             imgproc::LINE_8,
             0,
         )?;
 
         // Rotate frame if necessary
-        // MOVE THIS EARLIER
+        // Not currently working
         if rotate {
             let mut rotated_frame = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
             opencv::core::rotate(
@@ -673,7 +677,7 @@ fn main() -> Result<()> {
                     display_card.push_back(row);
                 } else if row.update_type == TURN_DATA_TYPE {
                     turn_counter += 1;
-                    turn_player.swap_update();
+                    turn_player.swap_update(&first_turn_player);
                 } else {
                     if let Some(life) = row.player1_life {
                         player1_life = life;
@@ -755,7 +759,7 @@ fn main() -> Result<()> {
                     &mut card_image,
                     core::Rect::new(0, 0, card_width, card_height),
                     Scalar::new(0.0, 0.0, 0.0, 0.0),
-                    CARD_BORDER_WIDTH, // Thickness of -1 fills the rectangle completely
+                    (CARD_BORDER_WIDTH as f64 * font_scale) as i32,
                     LINE_8,
                     0,
                 );

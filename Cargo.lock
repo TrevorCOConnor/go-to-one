@@ -50,6 +50,7 @@ dependencies = [
  "csv",
  "futures",
  "lib",
+ "libmpv",
  "tokio",
 ]
 
@@ -889,6 +890,21 @@ name = "libc"
 version = "0.2.170"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875b3680cb2f8f71bdcf9a30f38d48282f5d3c95cbf9b3fa57269bb5d5c06828"
+
+[[package]]
+name = "libmpv"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61a58e2d19b34775e81e0fdca194b3b8ee8de973b092e7582b416343979e22e7"
+dependencies = [
+ "libmpv-sys",
+]
+
+[[package]]
+name = "libmpv-sys"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0df938d3145cd8f134572721a27afa3a51f9bc1c26ae30a1d5077162f96d074b"
 
 [[package]]
 name = "linux-raw-sys"

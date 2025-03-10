@@ -1,10 +1,11 @@
 use chrono;
-use csv::StringRecord;
+use libmpv::{FileState, Mpv};
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{stdin, stdout, Write},
+    io::{stdout, Write},
     process::exit,
+    thread,
     time::{self, Duration},
 };
 
@@ -23,45 +24,9 @@ use lib::{
     card::{CardDB, CardData},
 };
 
-#[derive(Debug)]
-struct TimeTick {
-    sec: u64,
-    milli: f64,
-}
-
-impl TimeTick {
-    fn scale(&self, scalar: f64) -> Self {
-        let new_milli = self.milli * scalar;
-        let overflow = new_milli.div_euclid(MILLI);
-        let new_sec = (self.sec as f64) * scalar + overflow;
-        let new_milli = new_milli.rem_euclid(MILLI);
-
-        TimeTick {
-            sec: new_sec as u64,
-            milli: new_milli,
-        }
-    }
-
-    fn offset(&self, offset: f64) -> Self {
-        let _offset = offset * MILLI;
-
-        let sec_offset = _offset.div_euclid(MILLI);
-        let milli_offset = _offset.rem_euclid(MILLI);
-
-        let new_sec = (self.sec as f64) + sec_offset;
-        let new_milli = self.milli + milli_offset;
-
-        TimeTick {
-            sec: new_sec as u64,
-            milli: new_milli,
-        }
-    }
-}
-
 const MILLI: f64 = 1000.0;
 
 enum Command {
-    PAUSE,
     HEALTH,
     TURN,
     QUIT,
@@ -69,19 +34,13 @@ enum Command {
 
 impl Command {
     fn get_all() -> Vec<Self> {
-        Vec::from([
-            Command::HEALTH,
-            Command::PAUSE,
-            Command::TURN,
-            Command::QUIT,
-        ])
+        Vec::from([Command::HEALTH, Command::TURN, Command::QUIT])
     }
 }
 
 impl Named for Command {
     fn get_name(&self) -> &str {
         match self {
-            Command::PAUSE => ":p",
             Command::HEALTH => ":h",
             Command::TURN => ":t",
             Command::QUIT => ":q",
@@ -173,25 +132,17 @@ impl Record {
 }
 
 struct RecordKeeper {
-    start_time: time::Instant,
     player1_life: u32,
     player2_life: u32,
     records: Vec<Record>,
-    paused: bool,
-    pause_time: Option<time::Instant>,
-    pause_offset: Duration,
 }
 
 impl RecordKeeper {
     fn build(hero1: &CardData, hero2: &CardData, first: &str) -> RecordKeeper {
         let mut rk = RecordKeeper {
-            start_time: time::Instant::now(),
             player1_life: hero1.life.expect("Hero1 should have life"),
             player2_life: hero2.life.expect("Hero2 should have life"),
             records: Vec::new(),
-            paused: false,
-            pause_time: None,
-            pause_offset: Duration::from_secs(0),
         };
 
         let hero1_record = Record {
@@ -223,11 +174,10 @@ impl RecordKeeper {
         rk
     }
 
-    fn add_card_update(&mut self, name: &str, pitch: Option<u32>) {
-        let diff = time::Instant::now() - self.start_time;
-        let milli = diff.as_millis().rem_euclid(MILLI as u128);
+    fn add_card_update(&mut self, mpv: &Mpv, name: &str, pitch: Option<u32>) {
+        let (sec, milli) = Self::get_time(mpv);
         self.records.push(Record {
-            sec: diff.as_secs(),
+            sec,
             milli,
             name: Some(name.to_owned()),
             pitch,
@@ -237,26 +187,15 @@ impl RecordKeeper {
         });
     }
 
-    fn get_time(&self) -> (u64, u128) {
-        let diff = time::Instant::now() - self.start_time - self.pause_offset;
-        let secs = diff.as_secs();
-        let milli = diff.as_millis().rem_euclid(MILLI as u128);
-        (secs, milli)
+    fn get_time(mpv: &Mpv) -> (u64, u128) {
+        let timestamp = mpv.get_property::<f64>("playback-time").unwrap();
+        let sec = timestamp.trunc() as u64;
+        let milli = (timestamp.fract() * MILLI) as u128;
+        (sec, milli)
     }
 
-    fn pause(&mut self) {
-        if self.paused {
-            self.paused = false;
-            self.pause_offset += time::Instant::now() - self.pause_time.unwrap();
-            self.pause_time = None;
-        } else {
-            self.paused = true;
-            self.pause_time = Some(time::Instant::now());
-        }
-    }
-
-    fn add_player_life_update(&mut self, player: u8, operation: &char, value: u32) {
-        let (sec, milli) = self.get_time();
+    fn add_player_life_update(&mut self, mpv: &Mpv, player: u8, operation: &char, value: u32) {
+        let (sec, milli) = Self::get_time(mpv);
         // Get old life of player
         let old_life = if player == 1 {
             self.player1_life
@@ -296,8 +235,8 @@ impl RecordKeeper {
         self.records.push(record);
     }
 
-    fn add_turn_update(&mut self) {
-        let (sec, milli) = self.get_time();
+    fn add_turn_update(&mut self, mpv: &Mpv) {
+        let (sec, milli) = Self::get_time(mpv);
         let record = Record {
             sec,
             milli,
@@ -313,6 +252,7 @@ impl RecordKeeper {
 
 async fn handle_events(
     output_fp: &str,
+    mpv: &Mpv,
     card_db: &CardDB,
     hero1: &CardData,
     hero2: &CardData,
@@ -328,6 +268,7 @@ async fn handle_events(
     let commands = Command::get_all();
     let mut record_keeper = RecordKeeper::build(hero1, hero2, first);
 
+    mpv.unpause().unwrap();
     loop {
         let mut event = reader.next().fuse();
         select! {
@@ -335,23 +276,12 @@ async fn handle_events(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Event::Key(key) = event {
-                            if record_keeper.paused {
-                                match key.code {
-                                    KeyCode::Enter => {},
-                                    KeyCode::Char(' ') => {}
-                                    KeyCode::Esc => {}
-                                    _ => {
-                                        continue;
-                                    }
-                                }
-                                record_keeper.pause();
-                            }
-                            else if is_life_update(&text) {
+                            if is_life_update(&text) {
                                 command_suggestions = VecDeque::new();
                                 match key.code {
                                     KeyCode::Enter => {
                                         if let Some((player, operation, value)) = extract_life_update(&text) {
-                                            record_keeper.add_player_life_update(player, &operation, value);
+                                            record_keeper.add_player_life_update(&mpv, player, &operation, value);
                                         }
                                         let pos = position().unwrap();
                                         let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
@@ -367,6 +297,7 @@ async fn handle_events(
                                     KeyCode::Esc => {
                                         text = String::new();
                                         command_suggestions = VecDeque::new();
+                                        card_suggestions = VecDeque::new();
                                     },
                                     _ => continue
                                 }
@@ -383,13 +314,8 @@ async fn handle_events(
                                     },
                                     AutocompleteResult::Finished(command) => {
                                         match command {
-                                            Command::PAUSE => {
-                                                record_keeper.pause();
-                                                text = String::new();
-                                                command_suggestions = VecDeque::new();
-                                            },
                                             Command::TURN => {
-                                                record_keeper.add_turn_update();
+                                                record_keeper.add_turn_update(mpv);
                                                 text = String::new();
                                                 command_suggestions = VecDeque::new();
                                                 let pos = position().unwrap();
@@ -411,7 +337,6 @@ async fn handle_events(
                                         text: new_text,
                                         suggestions: new_suggestions
                                     } => {
-
                                         text = new_text;
                                         card_suggestions = new_suggestions;
                                     },
@@ -420,7 +345,7 @@ async fn handle_events(
                                             let pos = position().unwrap();
                                             let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
                                             println!("> {}", suggest.display);
-                                            record_keeper.add_card_update(&card.name, card.pitch);
+                                            record_keeper.add_card_update(&mpv, &card.name, card.pitch);
                                             text = String::new();
                                             card_suggestions = VecDeque::new();
                                         }
@@ -431,18 +356,14 @@ async fn handle_events(
                             let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
 
                             let display = {
-                                if record_keeper.paused {
-                                    "PAUSED"
+                                if let Some(suggest) = card_suggestions.front() {
+                                    let split = suggest.display.split_at(text.len());
+                                    &format!("{}{}", split.0, split.1.grey())
+                                } else if let Some(suggest) = command_suggestions.front()  {
+                                    let split = suggest.get_name().split_at(text.len());
+                                    &format!("{}{}", split.0, split.1.grey())
                                 } else {
-                                    if let Some(suggest) = card_suggestions.front() {
-                                        let split = suggest.display.split_at(text.len());
-                                        &format!("{}{}", split.0, split.1.grey())
-                                    } else if let Some(suggest) = command_suggestions.front()  {
-                                        let split = suggest.get_name().split_at(text.len());
-                                        &format!("{}{}", split.0, split.1.grey())
-                                    } else {
-                                        &text
-                                    }
+                                    &text
                                 }
                             };
                             println!("> {}", display);
@@ -454,6 +375,15 @@ async fn handle_events(
                 };
             }
         }
+        if !text.is_empty() || !card_suggestions.is_empty() || !command_suggestions.is_empty() {
+            if !mpv.get_property("pause").unwrap_or(true) {
+                let _ = mpv.pause();
+            }
+        } else {
+            if mpv.get_property("pause").unwrap_or(true) {
+                let _ = mpv.unpause();
+            }
+        }
     }
 
     let _ = write!(&mut output_file, "{}", Record::headers());
@@ -462,74 +392,38 @@ async fn handle_events(
     }
 }
 
-fn modify_time(input_fp: &str, output_fp: &str, scalar: Option<f64>, offset: Option<f64>) {
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
-        .from_path(input_fp)
-        .expect("Could not load card file");
-
-    let headers = reader.headers().unwrap().clone();
-
-    let records: Vec<Result<StringRecord, _>> = reader.into_records().collect();
-
-    let mut wtr = csv::WriterBuilder::new()
-        .delimiter(b'\t')
-        .from_path(output_fp)
-        .unwrap();
-
-    let _ = wtr.write_record(&headers);
-
-    for record in records {
-        let record = record.unwrap();
-        let sec = record[0].parse::<u64>().expect("Sec invalid");
-        let milli = record[1].parse::<f64>().expect("Milli invalid");
-
-        let mut time_tick = TimeTick { sec, milli };
-        if let Some(sclr) = scalar {
-            time_tick = time_tick.scale(sclr);
-        }
-        if let Some(off) = offset {
-            time_tick = time_tick.offset(off)
-        }
-
-        let mut new_line = vec![time_tick.sec.to_string(), time_tick.milli.to_string()];
-        new_line.extend(record.iter().map(|v| v.to_string()).skip(2));
-
-        let _ = wtr.write_record(&new_line);
-    }
-}
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
+
+    // Verify args
+    if args.len() < 2 {
+        println!("Video file name missing");
+        exit(0)
+    }
+    if args.len() < 4 {
         println!("Player name arguments missing");
         exit(0)
     }
-    if args[1] == "--modify" {
-        let input_fp = &args[2];
-        let output_fp = &args[3];
-        let mut scalar = None;
-        let mut offset = None;
 
-        for i in 0..=1 {
-            if args.len() >= 5 + 2 * i {
-                let modifier = &args[4 + (2 * i)];
-                println!("{}", modifier);
-                if modifier == "--scale" {
-                    scalar = args[5 + 2 * i].parse::<f64>().ok();
-                }
-                if modifier == "--offset" {
-                    offset = args[5 + 2 * i].parse::<f64>().ok();
-                }
-            }
-        }
-        modify_time(input_fp, output_fp, scalar, offset);
-        exit(0);
+    // Verify video fp
+    let video_fp = &args[1];
+    if !std::fs::exists(video_fp)? {
+        println!("File does not exist");
+        return Ok(());
     }
+    println!("{}", video_fp);
 
-    let player1 = args[1].to_string();
-    let player2 = args[2].to_string();
+    // Load video file
+    // TODO: Improve error handling
+    let mpv = Mpv::new().unwrap();
+    mpv.playlist_load_files(&[(&video_fp, FileState::AppendPlay, None)])
+        .unwrap();
+    mpv.pause().unwrap();
+
+    // Get player names
+    let player1 = args[2].to_string();
+    let player2 = args[3].to_string();
     let output_fp = format!(
         "annotations/{}_v_{}_{}.tsv",
         player1,
@@ -551,8 +445,7 @@ async fn main() -> std::io::Result<()> {
         lib::autocomplete::AutocompleteOption::new("2".to_string()),
     ]);
     let first = lib::commands::get_user_input(&options).await;
-
-    println!("Press ENTER to start the timer:");
+    println!("Press ENTER to start:");
     let mut reader = EventStream::new();
     loop {
         let mut event = reader.next().fuse();
@@ -573,15 +466,11 @@ async fn main() -> std::io::Result<()> {
 
     let pos = position().unwrap();
     let _ = execute!(stdout(), MoveTo(0, pos.1));
-    println!("Timer started!");
-    let pos = position().unwrap();
-    let _ = execute!(stdout(), MoveTo(0, pos.1));
     print!("> ");
 
-    let mut stdout = stdout();
-    execute!(stdout)?;
+    execute!(&mut stdout())?;
 
-    handle_events(&output_fp, &card_db, hero1, hero2, first.text()).await;
+    handle_events(&output_fp, &mpv, &card_db, hero1, hero2, first.text()).await;
 
     disable_raw_mode()
 }
