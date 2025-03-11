@@ -30,11 +30,12 @@ enum Command {
     HEALTH,
     TURN,
     QUIT,
+    UNDO,
 }
 
 impl Command {
     fn get_all() -> Vec<Self> {
-        Vec::from([Command::HEALTH, Command::TURN, Command::QUIT])
+        Vec::from([Command::HEALTH, Command::TURN, Command::QUIT, Command::UNDO])
     }
 }
 
@@ -44,6 +45,7 @@ impl Named for Command {
             Command::HEALTH => ":h",
             Command::TURN => ":t",
             Command::QUIT => ":q",
+            Command::UNDO => ":u",
         }
     }
 }
@@ -81,6 +83,7 @@ fn extract_life_update(text: &str) -> Option<(u8, String)> {
     return None;
 }
 
+#[derive(PartialEq, Eq)]
 enum UpdateType {
     Life,
     Card,
@@ -315,6 +318,23 @@ async fn handle_events(
                                             Command::QUIT => {
                                                 break;
                                             },
+                                            Command::UNDO => {
+                                                let rec = record_keeper.records.last().unwrap();
+                                                let rec = {
+                                                    if rec.update_type == UpdateType::Hero1 || rec.update_type == UpdateType::Hero2 {
+                                                        None
+                                                    } else {
+                                                        record_keeper.records.pop()
+                                                    }
+                                                };
+                                                text = String::new();
+                                                command_suggestions = VecDeque::new();
+                                                let pos = position().unwrap();
+                                                let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
+                                                if let Some(v) = rec {
+                                                    println!("> {} record removed.", v.update_type.text());
+                                                }
+                                            }
                                             _ => {
                                             }
                                         }
