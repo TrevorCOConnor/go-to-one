@@ -109,6 +109,9 @@ struct Cli {
 
     #[arg(long)]
     crop_bottom: Option<f64>,
+
+    #[arg(long)]
+    output_file: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -243,7 +246,13 @@ fn main() -> Result<()> {
     };
 
     // Create output
-    let output_path = format!("output_videos/{}_output_video.mp4", chrono::Local::now());
+    let output_path = {
+        if let Some(out) = args.output_file {
+            out
+        } else {
+            format!("output_videos/{}_output_video.mp4", chrono::Local::now())
+        }
+    };
 
     // Create capture
     let mut cap = VideoCapture::from_file(&args.video_file, videoio::CAP_ANY)?;
@@ -406,7 +415,7 @@ fn main() -> Result<()> {
             Size::new(innerframe_width, innerframe_height),
             0.0,
             0.0,
-            opencv::imgproc::INTER_CUBIC,
+            opencv::imgproc::INTER_AREA,
         )?;
         let frame_rect = core::Rect::new(
             scoreboard_width,
