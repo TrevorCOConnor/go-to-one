@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use lib::image::get_card_art;
+use lib::{image::get_card_art, life_tracker::LifeTracker};
 use opencv::{
     core::{self, tempfile, MatTraitConst, Point, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
     imgcodecs,
@@ -78,8 +78,8 @@ struct DataRow {
     milli: f64,
     name: String,
     pitch: Option<u32>,
-    player1_life: Option<i32>,
-    player2_life: Option<i32>,
+    player1_life: Option<String>,
+    player2_life: Option<String>,
     update_type: String,
 }
 
@@ -329,11 +329,14 @@ fn main() -> Result<()> {
     let image_file = tempfile(".png").unwrap();
 
     // Track what the players lives should be so we can tick them down
-    let mut player1_life: i32 = hero1_stats.player1_life.unwrap() as i32;
-    let mut player2_life: i32 = hero2_stats.player2_life.unwrap() as i32;
+    let mut player1_life_tracker = LifeTracker::build(&hero1_stats.player1_life.unwrap());
+    let mut player2_life_tracker = LifeTracker::build(&hero2_stats.player2_life.unwrap());
 
-    let mut player1_display_life: i32 = player1_life;
-    let mut player2_display_life: i32 = player2_life;
+    // let mut player1_life: i32 = hero1_stats.player1_life.unwrap() as i32;
+    // let mut player2_life: i32 = hero2_stats.player2_life.unwrap() as i32;
+
+    // let mut player1_display_life: i32 = player1_life;
+    // let mut player2_display_life: i32 = player2_life;
 
     let mut life_ticker = 0;
     let life_ticker_mod = (LIFE_TICK / increment) as u32;
@@ -494,12 +497,14 @@ fn main() -> Result<()> {
 
         // Update life totals
         if life_ticker == 0 {
-            if player1_display_life != player1_life {
-                player1_display_life += (player1_life - player1_display_life).signum();
-            }
-            if player2_display_life != player2_life {
-                player2_display_life += (player2_life - player2_display_life).signum();
-            }
+            // if player1_display_life != player1_life {
+            //     player1_display_life += (player1_life - player1_display_life).signum();
+            // }
+            // if player2_display_life != player2_life {
+            //     player2_display_life += (player2_life - player2_display_life).signum();
+            // }
+            player1_life_tracker.tick_display();
+            player2_life_tracker.tick_display();
         }
 
         let mut baseline = 0;
@@ -538,7 +543,7 @@ fn main() -> Result<()> {
         // Player1 Life
         put_text(
             &mut frame,
-            &player1_display_life.to_string(),
+            &player1_life_tracker.display(),
             Point::new(
                 text_offset + scoreboard_width_buffer,
                 9 * (scoreboard_height / 24),
@@ -553,7 +558,7 @@ fn main() -> Result<()> {
         // Player2 Life
         put_text(
             &mut frame,
-            &player2_display_life.to_string(),
+            &player2_life_tracker.display(),
             Point::new(
                 scoreboard_width / 2 + text_offset + scoreboard_width_buffer,
                 9 * (scoreboard_height / 24),
@@ -679,11 +684,11 @@ fn main() -> Result<()> {
                     turn_counter += 1;
                     turn_player.swap_update(&first_turn_player);
                 } else {
-                    if let Some(life) = row.player1_life {
-                        player1_life = life;
+                    if let Some(update) = row.player1_life {
+                        player1_life_tracker.update(&update);
                     }
-                    if let Some(life) = row.player2_life {
-                        player2_life = life;
+                    if let Some(update) = row.player2_life {
+                        player2_life_tracker.update(&update);
                     }
                 }
             }

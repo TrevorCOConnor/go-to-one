@@ -5,8 +5,6 @@ use std::{
     fs::File,
     io::{stdout, Write},
     process::exit,
-    thread,
-    time::{self, Duration},
 };
 
 use futures::{future::FutureExt, select, StreamExt};
@@ -22,9 +20,11 @@ use crossterm::{
 use lib::{
     autocomplete::{get_user_input_for_autocomplete, AutocompleteResult, Named},
     card::{CardDB, CardData},
+    life_tracker::LifeTracker,
 };
 
 const MILLI: f64 = 1000.0;
+const SEEK_SECS: f64 = 2.0;
 
 enum Command {
     HEALTH,
@@ -56,28 +56,27 @@ fn is_life_update(text: &str) -> bool {
     text.starts_with(":h")
 }
 
-fn extract_life_update(text: &str) -> Option<(u8, char, u32)> {
+fn extract_life_update(text: &str) -> Option<(u8, String)> {
     let mut player = None;
-    let mut operation = None;
-    let mut value = None;
+    let mut update = None;
 
     let splits: Vec<&str> = text.split(" ").filter(|v| !v.is_empty()).collect();
-    if splits.len() == 4 && splits.first() == Some(&&":h") {
+    if splits.len() >= 3 && splits.first() == Some(&&":h") {
+        // Parse player
         if splits[1] == "1" {
-            player = Some(1);
+            player.replace(1);
         }
         if splits[1] == "2" {
-            player = Some(2);
+            player.replace(2);
         }
-        if ["+", "-", "="].contains(&splits[2]) {
-            operation = Some(splits[2].chars().next().unwrap());
-        }
-        if let Ok(val) = splits[3].parse::<u32>() {
-            value = Some(val);
+
+        // Parse update
+        if LifeTracker::parse_update(splits[2]).is_ok() {
+            update.replace(splits[2]);
         }
     }
-    if player.is_some() && operation.is_some() && value.is_some() {
-        return Some((player.unwrap(), operation.unwrap(), value.unwrap()));
+    if player.is_some() && update.is_some() {
+        return Some((player.unwrap(), update.unwrap().to_owned()));
     }
     return None;
 }
@@ -107,8 +106,8 @@ struct Record {
     milli: u128,
     name: Option<String>,
     pitch: Option<u32>,
-    player1_life: Option<u32>,
-    player2_life: Option<u32>,
+    player1_life: Option<String>,
+    player2_life: Option<String>,
     update_type: UpdateType,
 }
 
@@ -124,24 +123,20 @@ impl Record {
             self.milli,
             self.name.unwrap_or("".to_string()),
             self.pitch.map_or("".to_string(), |v| v.to_string()),
-            self.player1_life.map_or("".to_string(), |v| v.to_string()),
-            self.player2_life.map_or("".to_string(), |v| v.to_string()),
+            self.player1_life.unwrap_or("".to_string()),
+            self.player2_life.unwrap_or("".to_string()),
             self.update_type.text()
         )
     }
 }
 
 struct RecordKeeper {
-    player1_life: u32,
-    player2_life: u32,
     records: Vec<Record>,
 }
 
 impl RecordKeeper {
     fn build(hero1: &CardData, hero2: &CardData, first: &str) -> RecordKeeper {
         let mut rk = RecordKeeper {
-            player1_life: hero1.life.expect("Hero1 should have life"),
-            player2_life: hero2.life.expect("Hero2 should have life"),
             records: Vec::new(),
         };
 
@@ -150,7 +145,7 @@ impl RecordKeeper {
             milli: 0,
             name: Some(hero1.name.to_owned()),
             pitch: None,
-            player1_life: Some(hero1.life.unwrap()),
+            player1_life: Some(hero1.life.unwrap().to_string()),
             player2_life: None,
             update_type: UpdateType::Hero1,
         };
@@ -160,7 +155,7 @@ impl RecordKeeper {
             name: Some(hero2.name.to_owned()),
             pitch: None,
             player1_life: None,
-            player2_life: Some(hero2.life.unwrap()),
+            player2_life: Some(hero2.life.unwrap().to_string()),
             update_type: UpdateType::Hero2,
         };
         if first == "1" {
@@ -194,35 +189,19 @@ impl RecordKeeper {
         (sec, milli)
     }
 
-    fn add_player_life_update(&mut self, mpv: &Mpv, player: u8, operation: &char, value: u32) {
+    fn add_player_life_update(&mut self, mpv: &Mpv, player: u8, update: &str) {
         let (sec, milli) = Self::get_time(mpv);
-        // Get old life of player
-        let old_life = if player == 1 {
-            self.player1_life
-        } else {
-            self.player2_life
-        };
-
-        // Calculate new life
-        let new_value = {
-            match operation {
-                '=' => value,
-                '+' => old_life + value,
-                '-' => old_life.checked_sub(value).unwrap_or(0),
-                _ => panic!("Invalid operation given"),
-            }
-        };
-
-        // Update life tracker
-        if player == 1 {
-            self.player1_life = new_value;
-        } else {
-            self.player2_life = new_value;
-        }
-
         // Save record
-        let player1_new_life = if player == 1 { Some(new_value) } else { None };
-        let player2_new_life = if player == 2 { Some(new_value) } else { None };
+        let player1_new_life = if player == 1 {
+            Some(update.to_string())
+        } else {
+            None
+        };
+        let player2_new_life = if player == 2 {
+            Some(update.to_string())
+        } else {
+            None
+        };
         let record = Record {
             sec,
             milli,
@@ -247,6 +226,10 @@ impl RecordKeeper {
             update_type: UpdateType::Turn,
         };
         self.records.push(record);
+    }
+
+    fn sort_records(&mut self) {
+        self.records.sort_by_key(|v| (v.sec, v.milli));
     }
 }
 
@@ -276,12 +259,19 @@ async fn handle_events(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Event::Key(key) = event {
-                            if is_life_update(&text) {
+                            // Seek back
+                            if key.code == KeyCode::Left && text.is_empty() {
+                                let _ = mpv.seek_backward(SEEK_SECS);
+                            // Seek forward
+                            } else if key.code == KeyCode::Right && text.is_empty() {
+                                let _ = mpv.seek_forward(SEEK_SECS);
+                            // Life update
+                            } else if is_life_update(&text) {
                                 command_suggestions = VecDeque::new();
                                 match key.code {
                                     KeyCode::Enter => {
-                                        if let Some((player, operation, value)) = extract_life_update(&text) {
-                                            record_keeper.add_player_life_update(&mpv, player, &operation, value);
+                                        if let Some((player, update)) = extract_life_update(&text) {
+                                            record_keeper.add_player_life_update(&mpv, player, &update);
                                         }
                                         let pos = position().unwrap();
                                         let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
@@ -301,8 +291,8 @@ async fn handle_events(
                                     },
                                     _ => continue
                                 }
-                            }
-                            else if is_command(&text) || (text.is_empty() && key.code == KeyCode::Char(':')) {
+                            // Command
+                            } else if is_command(&text) || (text.is_empty() && key.code == KeyCode::Char(':')) {
                                 let autocomplete_result = get_user_input_for_autocomplete(&commands, &text, &command_suggestions, key);
 
                                 match autocomplete_result {
@@ -330,6 +320,7 @@ async fn handle_events(
                                         }
                                     }
                                 };
+                            // Anything else
                             } else {
                                 let autocomplete_result = get_user_input_for_autocomplete(&card_db.cards, &text, &card_suggestions, key);
                                 match autocomplete_result {
@@ -387,6 +378,7 @@ async fn handle_events(
     }
 
     let _ = write!(&mut output_file, "{}", Record::headers());
+    record_keeper.sort_records();
     for rec in record_keeper.records {
         let _ = write!(output_file, "{}", rec.text());
     }
