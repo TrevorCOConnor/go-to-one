@@ -332,12 +332,6 @@ fn main() -> Result<()> {
     let mut player1_life_tracker = LifeTracker::build(&hero1_stats.player1_life.unwrap());
     let mut player2_life_tracker = LifeTracker::build(&hero2_stats.player2_life.unwrap());
 
-    // let mut player1_life: i32 = hero1_stats.player1_life.unwrap() as i32;
-    // let mut player2_life: i32 = hero2_stats.player2_life.unwrap() as i32;
-
-    // let mut player1_display_life: i32 = player1_life;
-    // let mut player2_display_life: i32 = player2_life;
-
     let mut life_ticker = 0;
     let life_ticker_mod = (LIFE_TICK / increment) as u32;
 
@@ -412,7 +406,7 @@ fn main() -> Result<()> {
             Size::new(innerframe_width, innerframe_height),
             0.0,
             0.0,
-            opencv::imgproc::INTER_AREA,
+            opencv::imgproc::INTER_CUBIC,
         )?;
         let frame_rect = core::Rect::new(
             scoreboard_width,
