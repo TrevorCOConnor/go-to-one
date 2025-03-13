@@ -347,7 +347,7 @@ fn main() -> Result<()> {
     let mut debug_tracker = 0_u32;
     let debug_skip_count = (original_fps / fps) as u32;
 
-    let mut turn_counter = 1_u32;
+    let mut turn_counter = 0_u32;
 
     // LOOP HERE
     loop {
@@ -589,43 +589,45 @@ fn main() -> Result<()> {
         );
 
         // Turn counter
-        let mut baseline = 0;
-        let text_size = get_text_size(
-            "Turn 10",
-            TURN_FONT_FACE,
-            TURN_FONT_SCALE * font_scale,
-            TURN_FONT_THICKNESS * font_scale as i32,
-            &mut baseline,
-        )?;
-        let turn_counter_rect = core::Rect::new(
-            (frame_width as i32) - text_size.width - 2 * scoreboard_width_buffer,
-            0,
-            text_size.width + 2 * scoreboard_width_buffer,
-            text_size.height + 2 * scoreboard_height_buffer,
-        );
+        if turn_counter > 0 {
+            let mut baseline = 0;
+            let text_size = get_text_size(
+                "Turn 10",
+                TURN_FONT_FACE,
+                TURN_FONT_SCALE * font_scale,
+                TURN_FONT_THICKNESS * font_scale as i32,
+                &mut baseline,
+            )?;
+            let turn_counter_rect = core::Rect::new(
+                (frame_width as i32) - text_size.width - 2 * scoreboard_width_buffer,
+                0,
+                text_size.width + 2 * scoreboard_width_buffer,
+                text_size.height + 2 * scoreboard_height_buffer,
+            );
 
-        let _ = imgproc::rectangle(
-            &mut frame,
-            turn_counter_rect,
-            Scalar::new(0., 0., 0., 0.),
-            -1,
-            imgproc::LINE_8,
-            0,
-        );
-        let _ = put_text(
-            &mut frame,
-            &format!("Turn {}", turn_counter),
-            Point::new(
-                (frame_width as i32) - text_size.width - scoreboard_width_buffer,
-                text_size.height + scoreboard_height_buffer,
-            ),
-            TURN_FONT_FACE,
-            TURN_FONT_SCALE * font_scale,
-            Scalar::new(255.0, 255.0, 255.0, 0.0),
-            TURN_FONT_THICKNESS * font_scale as i32,
-            LINE_AA,
-            false,
-        );
+            let _ = imgproc::rectangle(
+                &mut frame,
+                turn_counter_rect,
+                Scalar::new(0., 0., 0., 0.),
+                -1,
+                imgproc::LINE_8,
+                0,
+            );
+            let _ = put_text(
+                &mut frame,
+                &format!("Turn {}", turn_counter),
+                Point::new(
+                    (frame_width as i32) - text_size.width - scoreboard_width_buffer,
+                    text_size.height + scoreboard_height_buffer,
+                ),
+                TURN_FONT_FACE,
+                TURN_FONT_SCALE * font_scale,
+                Scalar::new(255.0, 255.0, 255.0, 0.0),
+                TURN_FONT_THICKNESS * font_scale as i32,
+                LINE_AA,
+                false,
+            );
+        }
 
         // GoToOne Logo
         let _logo_image = imgcodecs::imread(&LOGO_FP, imgcodecs::IMREAD_COLOR).unwrap();
