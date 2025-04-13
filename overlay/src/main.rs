@@ -30,7 +30,7 @@ const CARD_BORDER_WIDTH: i32 = 9;
 const MILLI: f64 = 1_000.0;
 
 // Background
-const BACKGROUND_ANIM_FILE: &'static str = "data/05ab24246ec26614fa27106953bbf7fcaa83ebae.gif";
+const BACKGROUND_ANIM_FILE: &'static str = "data/199621-910995780.mp4";
 
 // Frame dimensions
 const FRAME_WIDTH_RATIO: f64 = 1.0 - (1.0 / 64.0);
@@ -67,7 +67,7 @@ const TURN_DATA_TYPE: &str = "turn";
 const LOGO_FP: &str = "data/image.png";
 
 // Debug FPS
-const DEBUG_FPS: f64 = 5.;
+const DEBUG_FPS: f64 = 10.;
 
 // Change the alias to use `Box<dyn error::Error>`.
 type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
@@ -313,8 +313,6 @@ fn main() -> Result<()> {
     let hero2_img = get_card_art(&hero2_image_file, hero_width, hero_length)
         .expect("Could not load hero2 image");
 
-    // let hero = format!("{}\n vs\n{}", hero1.name, hero2.name);
-
     // Card dimensions
     let card_height = scoreboard_height / 2;
     let card_width = ((card_height as f64) * CARD_WIDTH_RATIO) as i32;
@@ -351,6 +349,7 @@ fn main() -> Result<()> {
 
     // LOOP HERE
     loop {
+        // Check timeout
         if let Some(sec) = args.timeout {
             if time_tick.sec > sec {
                 break;
