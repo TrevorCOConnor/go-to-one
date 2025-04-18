@@ -1,8 +1,16 @@
 use clap::Parser;
 
-use lib::{image::get_card_art, life_tracker::LifeTracker};
+use lib::{
+    fade::{overlay_image_sectional_with_removal, remove_color, remove_white_corners},
+    image::get_card_art,
+    life_tracker::LifeTracker,
+    rotate::rotate_image,
+};
 use opencv::{
-    core::{self, tempfile, MatTraitConst, Point, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
+    core::{
+        self, no_array, tempfile, MatTraitConst, Point, Scalar, Size, UMat, UMatTrait,
+        UMatTraitConst, Vector,
+    },
     imgcodecs,
     imgproc::{
         self, get_text_size, put_text, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX, LINE_8,
@@ -22,11 +30,12 @@ const FADE_IN_DURATION: f64 = 0.75;
 const DISPLAY_DURATION: f64 = 6.0;
 const EXTENDED_DISPLAY_DURATION: f64 = 12.0;
 const FADE_OUT_DURATION: f64 = 0.75;
+const PIXEL_SECTION: i32 = 2;
 
 // Constants
 const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
 const CARD_HEIGHT_RATIO: f64 = 628.0 / 450.0;
-const CARD_BORDER_WIDTH: i32 = 9;
+const CARD_BORDER_WIDTH: i32 = 30;
 const MILLI: f64 = 1_000.0;
 
 // Background
@@ -65,6 +74,7 @@ const TURN_DATA_TYPE: &str = "turn";
 
 // Logo
 const LOGO_FP: &str = "data/image.png";
+const CARD_BACK_FP: &str = "data/cardback.png";
 
 // Debug FPS
 const DEBUG_FPS: f64 = 10.;
@@ -178,9 +188,11 @@ impl PartialOrd for TimeTick {
 
 #[derive(Debug, PartialEq, Eq)]
 enum FadeStage {
+    PRE,
     IN,
     DISPLAY,
     OUT,
+    POST,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -206,6 +218,11 @@ impl TurnPlayer {
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+
+    // Load card back
+    let mut card_back_img = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+    let _card_back = imgcodecs::imread(&CARD_BACK_FP, imgcodecs::IMREAD_COLOR).unwrap();
+    _card_back.copy_to(&mut card_back_img)?;
 
     // Load card db
     let card_image_db = lib::card::CardImageDB::init();
@@ -316,6 +333,19 @@ fn main() -> Result<()> {
     // Card dimensions
     let card_height = scoreboard_height / 2;
     let card_width = ((card_height as f64) * CARD_WIDTH_RATIO) as i32;
+    let y_offset = 4 * scoreboard_height_buffer + 3 * (scoreboard_height / 6);
+    let card_rect = core::Rect::new(scoreboard_width_buffer, y_offset, card_width, card_height);
+
+    // Adjust cardback and prevent further mutations
+    opencv::imgproc::resize(
+        &card_back_img.clone(),
+        &mut card_back_img,
+        Size::new(card_width, card_height),
+        0.0,
+        0.0,
+        opencv::imgproc::INTER_LINEAR,
+    )?;
+    let card_back_img = card_back_img;
 
     let increment = original_fps.recip() * MILLI;
 
@@ -331,6 +361,7 @@ fn main() -> Result<()> {
     // Set init vars
     let mut display_start_time = None;
     let mut fade_start_time: Option<TimeTick> = None;
+    let mut post_fade_start_time: Option<TimeTick> = None;
     let mut time_tick = TimeTick::new();
     let mut display_card: VecDeque<DataRow> = VecDeque::new();
     let image_file = tempfile(".png").unwrap();
@@ -346,6 +377,7 @@ fn main() -> Result<()> {
     let debug_skip_count = (original_fps / fps) as u32;
 
     let mut turn_counter = 0_u32;
+    let mut card_back = true;
 
     // LOOP HERE
     loop {
@@ -705,33 +737,54 @@ fn main() -> Result<()> {
             card_image_db.load_card_image(&card.name, &card.pitch, &image_file);
         }
 
-        // Display card
+        // Display card (rotate)
         if let (Some(_), Some(start_time)) = (&display_card.front(), &display_start_time) {
             let elapsed_time = (time_tick - *start_time).as_f64();
-            if elapsed_time <= EXTENDED_DISPLAY_DURATION
-                && fade_start_time.is_none_or(|v| (time_tick - v).as_f64() < FADE_OUT_DURATION)
+            // card has not faded out yet
+            if fade_start_time.is_none_or(|v| (time_tick - v).as_f64() < FADE_OUT_DURATION)
+                // Start flip to back
+                || (fade_start_time.is_some()
+                    && post_fade_start_time.is_none()
+                    && display_card.len() == 1)
+                // Flip to back in progress
+                || post_fade_start_time
+                    .is_some_and(|v| (time_tick - v).as_f64() < FADE_OUT_DURATION)
             {
                 let fade_stage = {
+                    // Fade out card back
+                    if elapsed_time < FADE_IN_DURATION && card_back {
+                        FadeStage::PRE
                     // Fade in
-                    if elapsed_time < FADE_IN_DURATION {
+                    } else if elapsed_time < FADE_IN_DURATION
+                        || (elapsed_time < 2.0 * FADE_IN_DURATION && card_back)
+                    {
                         FadeStage::IN
                     // Minimum Display time
                     } else if elapsed_time < DISPLAY_DURATION - FADE_OUT_DURATION {
                         FadeStage::DISPLAY
                     // Extended display
-                    } else if elapsed_time < EXTENDED_DISPLAY_DURATION - FADE_OUT_DURATION
+                    } else if elapsed_time < EXTENDED_DISPLAY_DURATION - 2.0 * FADE_OUT_DURATION
                         && display_card.len() == 1
                     {
                         FadeStage::DISPLAY
                     // Fade out
-                    } else {
+                    } else if elapsed_time < EXTENDED_DISPLAY_DURATION - FADE_OUT_DURATION {
                         FadeStage::OUT
+                    } else {
+                        FadeStage::POST
                     }
                 };
 
                 // Start fade out timer if not started yet
                 if fade_stage == FadeStage::OUT && fade_start_time.is_none() {
+                    card_back = false;
                     let _ = fade_start_time.insert(time_tick.clone());
+                }
+
+                // Start post fade out timer if not started yet
+                if fade_stage == FadeStage::POST && post_fade_start_time.is_none() {
+                    card_back = true;
+                    let _ = post_fade_start_time.insert(time_tick.clone());
                 }
 
                 let mut _card_image = imgcodecs::imread(&image_file, imgcodecs::IMREAD_COLOR)?;
@@ -757,47 +810,157 @@ fn main() -> Result<()> {
                     opencv::imgproc::INTER_LINEAR,
                 )?;
 
-                let y_offset = 4 * scoreboard_height_buffer + 3 * (scoreboard_height / 6);
-                let new_frame = frame.clone();
-                let card_rect =
-                    core::Rect::new(scoreboard_width_buffer, y_offset, card_width, card_height);
+                match fade_stage {
+                    FadeStage::PRE => {
+                        let alpha = elapsed_time / FADE_IN_DURATION;
+                        let green = UMat::new_rows_cols_with_default(
+                            card_image.rows(),
+                            card_image.cols(),
+                            card_image.typ(),
+                            Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            core::UMatUsageFlags::USAGE_DEFAULT,
+                        )?;
+                        let card = remove_white_corners(&green, &card_back_img)?;
 
-                let roi = new_frame.roi(card_rect)?;
-                let mut inner_roi = frame.roi_mut(card_rect)?;
-                let _ = imgproc::rectangle(
-                    &mut card_image,
-                    core::Rect::new(0, 0, card_width, card_height),
-                    Scalar::new(0.0, 0.0, 0.0, 0.0),
-                    (CARD_BORDER_WIDTH as f64 * font_scale) as i32,
-                    LINE_8,
-                    0,
-                );
+                        let rotated = rotate_image(&card, alpha as f32, true)?;
+                        let rotated_rect = core::Rect::new(
+                            scoreboard_width_buffer,
+                            y_offset - (rotated.rows() - card_height).div_euclid(2),
+                            rotated.cols(),
+                            rotated.rows(),
+                        );
 
-                let alpha = match fade_stage {
-                    FadeStage::IN => MAX_TRANSPARENCY * (elapsed_time / FADE_IN_DURATION),
-                    FadeStage::DISPLAY => MAX_TRANSPARENCY,
-                    FadeStage::OUT => {
-                        MAX_TRANSPARENCY
-                            * (1.0
-                                - ((time_tick - fade_start_time.unwrap()).as_f64()
-                                    / FADE_OUT_DURATION))
+                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+                        let _roi = &frame.roi(rotated_rect)?;
+                        _roi.copy_to(&mut roi)?;
+
+                        let card_rotation =
+                            remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                        let mut inner_roi = frame.roi_mut(rotated_rect)?;
+                        card_rotation.copy_to(&mut inner_roi)?;
                     }
-                };
+                    FadeStage::IN => {
+                        let adjusted_lapsed_time = {
+                            if card_back {
+                                elapsed_time - FADE_IN_DURATION
+                            } else {
+                                elapsed_time
+                            }
+                        };
 
-                core::add_weighted(
-                    &roi,
-                    1.0 - alpha,
-                    &card_image,
-                    alpha,
-                    0.0,
-                    &mut inner_roi,
-                    -1,
-                )?;
+                        let alpha = adjusted_lapsed_time / FADE_IN_DURATION;
+                        let green = UMat::new_rows_cols_with_default(
+                            card_image.rows(),
+                            card_image.cols(),
+                            card_image.typ(),
+                            Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            core::UMatUsageFlags::USAGE_DEFAULT,
+                        )?;
+                        let card = remove_white_corners(&green, &card_image)?;
+
+                        let rotated = rotate_image(&card, alpha as f32, false)?;
+                        let rotated_rect = core::Rect::new(
+                            scoreboard_width_buffer,
+                            y_offset - (rotated.rows() - card_height).div_euclid(2),
+                            rotated.cols(),
+                            rotated.rows(),
+                        );
+
+                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+                        let _roi = &frame.roi(rotated_rect)?;
+                        _roi.copy_to(&mut roi)?;
+
+                        let card_rotation =
+                            remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                        let mut inner_roi = frame.roi_mut(rotated_rect)?;
+                        card_rotation.copy_to(&mut inner_roi)?;
+                    }
+                    FadeStage::DISPLAY => {
+                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+                        let mut inner_roi = frame.roi_mut(card_rect)?;
+
+                        inner_roi.copy_to(&mut roi)?;
+
+                        let card_rotation = remove_white_corners(&roi, &card_image)?;
+                        card_rotation.copy_to(&mut inner_roi)?;
+                    }
+                    FadeStage::OUT => {
+                        let alpha =
+                            (time_tick - fade_start_time.unwrap()).as_f64() / FADE_OUT_DURATION;
+                        let green = UMat::new_rows_cols_with_default(
+                            card_image.rows(),
+                            card_image.cols(),
+                            card_image.typ(),
+                            Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            core::UMatUsageFlags::USAGE_DEFAULT,
+                        )?;
+                        let card = remove_white_corners(&green, &card_image)?;
+                        let rotated = rotate_image(&card, alpha as f32, true)?;
+                        let rotated_rect = core::Rect::new(
+                            scoreboard_width_buffer,
+                            y_offset - (rotated.rows() - card_height).div_euclid(2),
+                            rotated.cols(),
+                            rotated.rows(),
+                        );
+
+                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+                        let _roi = &frame.roi(rotated_rect)?;
+                        _roi.copy_to(&mut roi)?;
+
+                        let card_rotation =
+                            remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                        let card_rotation = remove_white_corners(&roi, &card_rotation)?;
+
+                        let mut inner_roi = frame.roi_mut(rotated_rect)?;
+                        card_rotation.copy_to(&mut inner_roi)?;
+                    }
+                    FadeStage::POST => {
+                        let alpha = (time_tick - post_fade_start_time.unwrap()).as_f64()
+                            / FADE_OUT_DURATION;
+                        let green = UMat::new_rows_cols_with_default(
+                            card_image.rows(),
+                            card_image.cols(),
+                            card_image.typ(),
+                            Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            core::UMatUsageFlags::USAGE_DEFAULT,
+                        )?;
+                        let card = remove_white_corners(&green, &card_back_img)?;
+                        let rotated = rotate_image(&card, alpha as f32, false)?;
+                        let rotated_rect = core::Rect::new(
+                            scoreboard_width_buffer,
+                            y_offset - (rotated.rows() - card_height).div_euclid(2),
+                            rotated.cols(),
+                            rotated.rows(),
+                        );
+
+                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+                        let _roi = &frame.roi(rotated_rect)?;
+                        _roi.copy_to(&mut roi)?;
+
+                        let card_rotation =
+                            remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                        let card_rotation = remove_white_corners(&roi, &card_rotation)?;
+
+                        let mut inner_roi = frame.roi_mut(rotated_rect)?;
+                        card_rotation.copy_to(&mut inner_roi)?;
+                    }
+                }
             } else {
                 display_card.pop_front();
                 display_start_time = None;
                 fade_start_time = None;
+                post_fade_start_time = None;
             }
+        }
+
+        if display_card.len() == 0 {
+            let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+            let mut inner_roi = frame.roi_mut(card_rect)?;
+
+            inner_roi.copy_to(&mut roi)?;
+
+            let card_rotation = remove_white_corners(&roi, &card_back_img)?;
+            card_rotation.copy_to(&mut inner_roi)?;
         }
 
         out.write(&frame)?;

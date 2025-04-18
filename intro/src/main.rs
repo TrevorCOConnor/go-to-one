@@ -193,60 +193,6 @@ fn determine_region_fade_percentage(
     Ok(fade_percent.powf(1.0 / 3.0))
 }
 
-fn overlay_video(
-    writer: &mut VideoWriter,
-    reader_file: &str,
-    img: &Mat,
-    display_count: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut video = VideoCapture::from_file(reader_file, videoio::CAP_ANY)?;
-
-    for i in 0..display_count {
-        println!("{} / {}", i, display_count);
-        let mut overlay = Mat::default();
-        // Exit early if video ends
-        if !video.read(&mut overlay).unwrap_or(false) {
-            break;
-        }
-
-        let mut resized = Mat::default();
-
-        resize(
-            &overlay,
-            &mut resized,
-            Size::new(img.cols(), img.rows()),
-            0.,
-            0.,
-            0,
-        )?;
-
-        let mut result_mat = img.clone();
-
-        for y in 0..resized.rows() {
-            for x in 0..resized.cols() {
-                let overlay_pixel = resized.at_2d::<Vec3b>(y, x)?;
-                let img_pixel = img.at_2d::<Vec3b>(y, x)?;
-
-                let fade_factor = determine_pixel_fade_percentage(&overlay_pixel);
-                let faded_pixel = [
-                    (f64::from(overlay_pixel[0]) * fade_factor
-                        + f64::from(img_pixel[0]) * (1.0 - fade_factor)) as u8,
-                    (f64::from(overlay_pixel[1]) * fade_factor
-                        + f64::from(img_pixel[1]) * (1.0 - fade_factor)) as u8,
-                    (f64::from(overlay_pixel[2]) * fade_factor
-                        + f64::from(img_pixel[2]) * (1.0 - fade_factor)) as u8,
-                ];
-                result_mat.at_2d_mut::<Vec3b>(y, x)?.0 = faded_pixel;
-            }
-        }
-        let mut end = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
-        result_mat.copy_to(&mut end)?;
-        writer.write(&end)?;
-    }
-
-    Ok(())
-}
-
 fn overlay_video_sectional(
     writer: &mut VideoWriter,
     reader_file: &str,
@@ -307,6 +253,48 @@ fn overlay_video_sectional(
         writer.write(&overlay)?;
     }
 
+    Ok(())
+}
+
+fn overlay_image_sectional(
+    background: &UMat,
+    foreground: &UMat,
+    pixels: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut background = background.clone();
+
+    let height = foreground.size()?.height;
+    let width = foreground.size()?.width;
+
+    for y in 0..height.div_euclid(pixels) {
+        for x in 0..width.div_euclid(pixels) {
+            // resize video to match image
+
+            let width_size = width - pixels * x;
+            let height_size = height - pixels * y;
+            let rect = Rect::new(
+                pixels * x,
+                pixels * y,
+                pixels.min(width_size),
+                pixels.min(height_size),
+            );
+            let origin_video_roi = background.roi(rect)?.try_clone()?;
+            let mut video_roi = background.roi_mut(rect)?;
+
+            let foreground_roi = foreground.roi(rect)?;
+
+            let fade_factor = determine_region_fade_percentage(&video_roi)?;
+            add_weighted(
+                &origin_video_roi,
+                fade_factor,
+                &foreground_roi,
+                1.0 - fade_factor,
+                0.,
+                &mut video_roi,
+                0,
+            )?;
+        }
+    }
     Ok(())
 }
 
