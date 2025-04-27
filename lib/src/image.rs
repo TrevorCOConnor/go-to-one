@@ -1,24 +1,17 @@
 use opencv::{
-    core::{MatTraitConst, Rect, Size, UMat, UMatTraitConst},
-    imgcodecs, imgproc, Error,
+    core::{Rect, Size, UMat, UMatTraitConst},
+    imgproc, Error,
 };
 
 const ART_RATIO: f64 = 3.0 / 5.0;
 const BORDER_X_RATIO: f64 = 1.0 / 30.0;
 const BORDER_Y_RATIO: f64 = 1.0 / 36.0;
 
-pub fn get_card_art(image_fp: &str, card_width: i32, card_height: i32) -> Result<UMat, Error> {
-    // Load the image
-    let img = imgcodecs::imread(image_fp, imgcodecs::IMREAD_COLOR)?;
-
-    // Check if the image was loaded successfully
-    if img.empty() {
-        panic!("Could not open or find the image!");
-    }
+pub fn get_card_art(image: &UMat, card_width: i32, card_height: i32) -> Result<UMat, Error> {
     // Resize card to match frame ratio
     let mut resized = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
     imgproc::resize(
-        &img,
+        &image,
         &mut resized,
         Size::new(card_width, card_height),
         0.0,

@@ -1,10 +1,18 @@
 use csv::StringRecord;
 use log::warn;
+use opencv::{
+    core::{MatTraitConst, UMat, Vector},
+    imgcodecs::{imdecode, IMREAD_COLOR, IMREAD_UNCHANGED},
+    imgproc::{cvt_color_def, COLOR_RGBA2BGR, COLOR_RGBA2RGB},
+};
 
 /// This may need to be replaced with an actual DB at some point
-use std::{collections::HashMap, fs::File, io::Write};
+use std::{collections::HashMap, fs::File};
 
-use crate::autocomplete::Named;
+use crate::{
+    autocomplete::Named,
+    fade::{convert_alpha_to_white, convert_alpha_to_white_mat, convert_alpha_to_white_umat},
+};
 
 const URL_FILE: &'static str = "data/card_data.csv";
 const CARD_FILE: &'static str = "data/card.csv";
@@ -139,12 +147,23 @@ impl CardImageDB {
         Self { uuid_card_map: map }
     }
 
-    /// This is almost certainly wrong
-    pub fn load_card_image(&self, name: &str, pitch: &Option<u32>, fp: &str) {
+    pub fn load_card_image(&self, name: &str, pitch: &Option<u32>) -> UMat {
         let url = &self.uuid_card_map[&(name.to_string(), pitch.to_owned())];
 
-        let mut file = std::fs::File::create(fp).unwrap();
-        let bytes = reqwest::blocking::get(url).unwrap().bytes().unwrap();
-        let _ = file.write_all(&bytes);
+        let mut image_mat = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
+        let img_vec = reqwest::blocking::get(url)
+            .unwrap()
+            .bytes()
+            .unwrap()
+            .to_vec();
+        let img_vec: Vector<u8> = Vector::from_iter(img_vec);
+        let img = imdecode(&img_vec, IMREAD_UNCHANGED).unwrap();
+
+        img.copy_to(&mut image_mat).unwrap();
+
+        let img = convert_alpha_to_white(&image_mat).unwrap();
+        cvt_color_def(&img, &mut image_mat, COLOR_RGBA2RGB).unwrap();
+
+        return image_mat;
     }
 }

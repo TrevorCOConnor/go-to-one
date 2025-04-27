@@ -1,8 +1,8 @@
 use opencv::{
     boxed_ref::BoxedRefMut,
     core::{
-        add_weighted, bitwise_and, bitwise_not, bitwise_or, bitwise_xor, in_range, no_array, Rect,
-        Scalar, UMat, UMatTrait, UMatTraitConst,
+        add_weighted, bitwise_and, bitwise_not, bitwise_or, in_range, no_array, Rect, Scalar, UMat,
+        UMatTrait, UMatTraitConst,
     },
 };
 
@@ -188,4 +188,28 @@ pub fn remove_white_corners(
     bitwise_or(&out.clone(), &inn, &mut out, &no_array())?;
 
     Ok(out)
+}
+
+pub fn convert_alpha_to_white(image: &UMat) -> Result<UMat, Box<dyn std::error::Error>> {
+    let mut alpha_mask = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
+
+    in_range(
+        image,
+        &Scalar::new(0.0, 0.0, 0.0, 0.0),
+        &Scalar::new(255.0, 255.0, 255.0, 0.0),
+        &mut alpha_mask,
+    )?;
+
+    let mut new = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
+    let white_mat = UMat::new_rows_cols_with_default(
+        image.rows(),
+        image.cols(),
+        image.typ(),
+        Scalar::new(255.0, 255.0, 255.0, 255.0),
+        opencv::core::UMatUsageFlags::USAGE_DEFAULT,
+    )?;
+    bitwise_or(&image, &white_mat, &mut new, &alpha_mask)?;
+    bitwise_or(&image, &new.clone(), &mut new, &no_array())?;
+
+    Ok(new)
 }

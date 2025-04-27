@@ -1,7 +1,7 @@
 use opencv::{
     calib3d::find_homography,
     core::{no_array, Point2f, Scalar, Size, UMat, Vector, BORDER_CONSTANT},
-    imgproc::{cvt_color_def, warp_perspective, COLOR_RGBA2BGR, COLOR_RGBA2RGB, INTER_LINEAR},
+    imgproc::{cvt_color_def, warp_perspective, COLOR_RGBA2RGB, INTER_LINEAR},
     prelude::*,
 };
 use std::error::Error;
@@ -81,7 +81,6 @@ pub fn rotate_image(
             ])
         }
     };
-    println!("{:?}", dst_points);
 
     // output
     let output_size = Size::new(width as i32, ((1.0 + CARD_HEIGHT_EXT) * height) as i32);
