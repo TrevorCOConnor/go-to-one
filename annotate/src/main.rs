@@ -1,10 +1,10 @@
 use chrono;
+use clap::Parser;
 use libmpv::{FileState, Mpv};
 use std::{
     collections::VecDeque,
     fs::File,
     io::{stdout, Write},
-    process::exit,
 };
 
 use futures::{future::FutureExt, select, StreamExt};
@@ -25,6 +25,28 @@ use lib::{
 
 const MILLI: f64 = 1000.0;
 const SEEK_SECS: f64 = 2.0;
+const CARD_INFO_DB_URL: &'static str =
+    "https://the-fab-cube.github.io/flesh-and-blood-cards/web/csvs/english/card.html";
+const CARD_IMG_DB_URL: &'static str =
+    "https://the-fab-cube.github.io/a58c5dbd-aac1-4de5-9ead-1787f64c5685";
+const CARD_INFO_DB_FP: &'static str = "data/card.csv";
+const CARD_IMG_DB_FP: &'static str = "data/card_data.csv";
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[arg(short, long)]
+    video_file: String,
+
+    #[arg(long, alias = "p1")]
+    player1: String,
+
+    #[arg(short, alias = "p2")]
+    player2: String,
+
+    #[arg(short, long, action)]
+    update_db: bool,
+}
 
 enum Command {
     HEALTH,
@@ -404,22 +426,41 @@ async fn handle_events(
     }
 }
 
+async fn update_cards() -> Result<(), Box<dyn std::error::Error>> {
+    // Card data
+    let resp = reqwest::get(CARD_INFO_DB_URL).await?;
+    if !resp.status().is_success() {
+        panic!("Couldn't reach card csv");
+    }
+
+    let mut file = File::create(CARD_INFO_DB_FP)?;
+    file.write_all(&resp.bytes().await?)?;
+
+    // Card img data
+    let resp = reqwest::get(CARD_IMG_DB_URL).await?;
+    if !resp.status().is_success() {
+        panic!("Couldn't reach card img csv");
+    }
+
+    let mut file = File::create(CARD_IMG_DB_FP)?;
+    file.write_all(&resp.bytes().await?)?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let args = Cli::parse();
 
-    // Verify args
-    if args.len() < 2 {
-        println!("Video file name missing");
-        exit(0)
-    }
-    if args.len() < 4 {
-        println!("Player name arguments missing");
-        exit(0)
+    // Check update
+    if args.update_db {
+        println!("Updating card db...");
+        update_cards().await.expect("Couldn't update card db");
+        println!("Card db updated!");
     }
 
     // Verify video fp
-    let video_fp = &args[1];
+    let video_fp = &args.video_file;
     if !std::fs::exists(video_fp)? {
         println!("File does not exist");
         return Ok(());
@@ -434,12 +475,10 @@ async fn main() -> std::io::Result<()> {
     mpv.pause().unwrap();
 
     // Get player names
-    let player1 = args[2].to_string();
-    let player2 = args[3].to_string();
     let output_fp = format!(
         "annotations/{}_v_{}_{}.tsv",
-        player1,
-        player2,
+        args.player1,
+        args.player2,
         chrono::Local::now()
     );
     let card_db = lib::card::CardDB::init();

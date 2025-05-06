@@ -129,13 +129,15 @@ pub fn remove_color(
     );
 
     in_range(foreground, &lower_bound, &upper_bound, &mut out_mask)?;
-    bitwise_not(&out_mask, &mut in_mask, &no_array())?;
+    bitwise_not(&out_mask, &mut in_mask, &no_array()).expect("Bitwise not failed");
 
     let mut out = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
     let mut inn = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
-    bitwise_and(background, background, &mut out, &out_mask)?;
-    bitwise_and(foreground, foreground, &mut inn, &in_mask)?;
-    bitwise_or(&out.clone(), &inn, &mut out, &no_array())?;
+    bitwise_and(background, background, &mut out, &out_mask)
+        .expect("Bitwise-and for out mask failed");
+    bitwise_and(foreground, foreground, &mut inn, &in_mask)
+        .expect("Bitwise-and for in mask failed");
+    bitwise_or(&out.clone(), &inn, &mut out, &no_array()).expect("Bitwise-or failed");
 
     Ok(out)
 }
@@ -176,16 +178,21 @@ pub fn remove_white_corners(
         &edge_mask,
         &mut out_mask,
         &mut no_array(),
-    )?;
+    )
+    .expect("bitwise-and in remove_white_corners failed");
 
-    bitwise_not(&out_mask, &mut in_mask, &no_array())?;
+    bitwise_not(&out_mask, &mut in_mask, &no_array())
+        .expect("bitwise_not in remove_white_corners failed");
 
     let mut out = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
     let mut inn = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
 
-    bitwise_and(foreground, foreground, &mut inn, &in_mask)?;
-    bitwise_and(background, background, &mut out, &out_mask)?;
-    bitwise_or(&out.clone(), &inn, &mut out, &no_array())?;
+    bitwise_and(foreground, foreground, &mut inn, &in_mask)
+        .expect("bitwise-and for in mask in remove_white_corners failed");
+    bitwise_and(background, background, &mut out, &out_mask)
+        .expect("bitwise-and for out mask in remove_white_corners failed");
+    bitwise_or(&out.clone(), &inn, &mut out, &no_array())
+        .expect("bitwise_or failed for in/ or mask in remove_white_corners");
 
     Ok(out)
 }
@@ -208,8 +215,9 @@ pub fn convert_alpha_to_white(image: &UMat) -> Result<UMat, Box<dyn std::error::
         Scalar::new(255.0, 255.0, 255.0, 255.0),
         opencv::core::UMatUsageFlags::USAGE_DEFAULT,
     )?;
-    bitwise_or(&image, &white_mat, &mut new, &alpha_mask)?;
-    bitwise_or(&image, &new.clone(), &mut new, &no_array())?;
+    bitwise_or(&image, &white_mat, &mut new, &alpha_mask)
+        .expect("converting alpha to white mask failed");
+    bitwise_or(&image, &new.clone(), &mut new, &no_array()).expect("copying image to white failed");
 
     Ok(new)
 }

@@ -787,9 +787,9 @@ fn main() -> Result<()> {
                     FadeStage::PRE => {
                         let alpha = elapsed_time / FADE_IN_DURATION;
                         let green = UMat::new_rows_cols_with_default(
-                            card_image.rows(),
-                            card_image.cols(),
-                            card_image.typ(),
+                            card_back_img.rows(),
+                            card_back_img.cols(),
+                            card_back_img.typ(),
                             Scalar::new(0.0, 255.0, 0.0, 0.0),
                             core::UMatUsageFlags::USAGE_DEFAULT,
                         )?;
@@ -940,7 +940,7 @@ fn main() -> Result<()> {
         if args.timeout.is_some() {
             bar.inc(increment as u64);
         } else {
-            bar.tick();
+            bar.inc(1);
         }
     }
 

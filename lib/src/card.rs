@@ -1,18 +1,16 @@
 use csv::StringRecord;
 use log::warn;
 use opencv::{
-    core::{MatTraitConst, UMat, Vector},
-    imgcodecs::{imdecode, IMREAD_COLOR, IMREAD_UNCHANGED},
-    imgproc::{cvt_color_def, COLOR_RGBA2BGR, COLOR_RGBA2RGB},
+    core::{MatTraitConst, UMat, UMatTrait, UMatTraitConst, Vector, CV_8U},
+    imgcodecs::{imdecode, IMREAD_UNCHANGED},
+    imgproc::{cvt_color_def, COLOR_RGBA2RGB},
+    rgbd::rescale_depth_def,
 };
 
 /// This may need to be replaced with an actual DB at some point
 use std::{collections::HashMap, fs::File};
 
-use crate::{
-    autocomplete::Named,
-    fade::{convert_alpha_to_white, convert_alpha_to_white_mat, convert_alpha_to_white_umat},
-};
+use crate::{autocomplete::Named, fade::convert_alpha_to_white};
 
 const URL_FILE: &'static str = "data/card_data.csv";
 const CARD_FILE: &'static str = "data/card.csv";
@@ -148,7 +146,11 @@ impl CardImageDB {
     }
 
     pub fn load_card_image(&self, name: &str, pitch: &Option<u32>) -> UMat {
-        let url = &self.uuid_card_map[&(name.to_string(), pitch.to_owned())];
+        let key = (name.to_string(), pitch.to_owned());
+        let url = self
+            .uuid_card_map
+            .get(&key)
+            .expect(&format!("{:?} not found in card image db", key));
 
         let mut image_mat = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
         let img_vec = reqwest::blocking::get(url)
@@ -163,6 +165,17 @@ impl CardImageDB {
 
         let img = convert_alpha_to_white(&image_mat).unwrap();
         cvt_color_def(&img, &mut image_mat, COLOR_RGBA2RGB).unwrap();
+
+        // I don't totally understand this, but Splatter Skull had a depth of 2 whereas every other
+        // image has a depth of 0, so this catches that case
+        if image_mat.depth() > 0 {
+            opencv::prelude::UMatTraitConst::convert_to_def(
+                &image_mat.clone(),
+                &mut image_mat,
+                CV_8U,
+            )
+            .unwrap();
+        }
 
         return image_mat;
     }
