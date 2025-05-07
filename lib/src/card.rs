@@ -15,7 +15,7 @@ use crate::{autocomplete::Named, fade::convert_alpha_to_white};
 const URL_FILE: &'static str = "data/card_data.csv";
 const CARD_FILE: &'static str = "data/card.csv";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CardData {
     pub name: String,
     pub pitch: Option<u32>,

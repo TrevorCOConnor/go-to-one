@@ -2,7 +2,6 @@ use chrono;
 use clap::Parser;
 use libmpv::{FileState, Mpv};
 use std::{
-    collections::VecDeque,
     fs::File,
     io::{stdout, Write},
 };
@@ -18,8 +17,8 @@ use crossterm::{
 };
 
 use lib::{
-    autocomplete::{get_user_input_for_autocomplete, AutocompleteResult, Named},
-    card::{CardDB, CardData},
+    autocomplete::{AutocompleteSuggestionManager, Named},
+    card::CardData,
     life_tracker::LifeTracker,
 };
 
@@ -53,11 +52,20 @@ enum Command {
     TURN,
     QUIT,
     UNDO,
+    WIN1,
+    WIN2,
 }
 
 impl Command {
     fn get_all() -> Vec<Self> {
-        Vec::from([Command::HEALTH, Command::TURN, Command::QUIT, Command::UNDO])
+        Vec::from([
+            Command::HEALTH,
+            Command::TURN,
+            Command::QUIT,
+            Command::UNDO,
+            Command::WIN1,
+            Command::WIN2,
+        ])
     }
 }
 
@@ -68,8 +76,21 @@ impl Named for Command {
             Command::TURN => ":t",
             Command::QUIT => ":q",
             Command::UNDO => ":u",
+            Command::WIN1 => ":w1",
+            Command::WIN2 => ":w2",
         }
     }
+}
+
+fn display_line_to_user(text: &str) {
+    let pos = position().unwrap();
+    let _ = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
+    println!("{}", format!("> {}", text));
+}
+
+fn clear_line() {
+    let pos = position().unwrap();
+    let _ = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
 }
 
 fn is_command(text: &str) -> bool {
@@ -112,6 +133,8 @@ enum UpdateType {
     Hero1,
     Hero2,
     Turn,
+    Win1,
+    Win2,
 }
 
 impl UpdateType {
@@ -122,6 +145,8 @@ impl UpdateType {
             UpdateType::Turn => "turn".to_string(),
             UpdateType::Hero1 => "hero1".to_string(),
             UpdateType::Hero2 => "hero2".to_string(),
+            UpdateType::Win1 => "win1".to_string(),
+            UpdateType::Win2 => "win2".to_string(),
         }
     }
 }
@@ -253,6 +278,28 @@ impl RecordKeeper {
         self.records.push(record);
     }
 
+    fn add_winner_update(&mut self, mpv: &Mpv, player: u8) {
+        let (sec, milli) = Self::get_time(mpv);
+        // Save record
+        let update_type = {
+            if player == 1 {
+                UpdateType::Win1
+            } else {
+                UpdateType::Win2
+            }
+        };
+        let record = Record {
+            sec,
+            milli,
+            name: None,
+            pitch: None,
+            player1_life: None,
+            player2_life: None,
+            update_type,
+        };
+        self.records.push(record);
+    }
+
     fn sort_records(&mut self) {
         self.records.sort_by_key(|v| (v.sec, v.milli));
     }
@@ -261,22 +308,22 @@ impl RecordKeeper {
 async fn handle_events(
     output_fp: &str,
     mpv: &Mpv,
-    card_db: &CardDB,
+    cards: &[CardData],
     hero1: &CardData,
     hero2: &CardData,
     first: &str,
 ) {
     let mut reader = EventStream::new();
     let mut text = String::new();
-    let mut card_suggestions: VecDeque<&CardData> = VecDeque::new();
-    let mut command_suggestions: VecDeque<&Command> = VecDeque::new();
+    let mut card_suggestions = AutocompleteSuggestionManager::build(cards.to_vec());
+    let mut command_suggestions = AutocompleteSuggestionManager::build(Command::get_all());
 
     let mut output_file = File::create(output_fp).expect("Couldn't write to file");
 
-    let commands = Command::get_all();
     let mut record_keeper = RecordKeeper::build(hero1, hero2, first);
 
     mpv.unpause().unwrap();
+
     loop {
         let mut event = reader.next().fuse();
         select! {
@@ -287,20 +334,20 @@ async fn handle_events(
                             // Seek back
                             if key.code == KeyCode::Left && text.is_empty() {
                                 let _ = mpv.seek_backward(SEEK_SECS);
+
                             // Seek forward
                             } else if key.code == KeyCode::Right && text.is_empty() {
                                 let _ = mpv.seek_forward(SEEK_SECS);
+
                             // Life update
                             } else if is_life_update(&text) {
-                                command_suggestions = VecDeque::new();
+                                command_suggestions.reset();
                                 match key.code {
                                     KeyCode::Enter => {
                                         if let Some((player, update)) = extract_life_update(&text) {
                                             record_keeper.add_player_life_update(&mpv, player, &update);
                                         }
-                                        let pos = position().unwrap();
-                                        let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
-                                        println!("> Player health updated");
+                                        display_line_to_user("Player health updated");
                                         text = String::new();
                                     },
                                     KeyCode::Char(c) => {
@@ -311,31 +358,27 @@ async fn handle_events(
                                     },
                                     KeyCode::Esc => {
                                         text = String::new();
-                                        command_suggestions = VecDeque::new();
-                                        card_suggestions = VecDeque::new();
+                                        command_suggestions.reset();
+                                        card_suggestions.reset();
                                     },
                                     _ => continue
                                 }
-                            // Command
-                            } else if is_command(&text) || (text.is_empty() && key.code == KeyCode::Char(':')) {
-                                let autocomplete_result = get_user_input_for_autocomplete(&commands, &text, &command_suggestions, key);
 
-                                match autocomplete_result {
-                                    AutocompleteResult::Continue{
-                                        text: new_text, suggestions: new_suggestions
-                                    } => {
-                                        text = new_text;
-                                        command_suggestions = new_suggestions;
-                                    },
-                                    AutocompleteResult::Finished(command) => {
+                            // Submit suggestion
+                            } else if key.code == KeyCode::Enter {
+                                // card
+                                if let Some(card) = card_suggestions.current_suggestion() {
+                                        display_line_to_user(&card.display);
+                                        record_keeper.add_card_update(&mpv, &card.name, card.pitch);
+                                        text = String::new();
+                                        card_suggestions.reset();
+                                        command_suggestions.reset();
+                                // command
+                                } else if let Some(command) = command_suggestions.current_suggestion() {
                                         match command {
                                             Command::TURN => {
                                                 record_keeper.add_turn_update(mpv);
-                                                text = String::new();
-                                                command_suggestions = VecDeque::new();
-                                                let pos = position().unwrap();
-                                                let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
-                                                println!("> Next turn started");
+                                                display_line_to_user("Next turn started");
                                             },
                                             Command::QUIT => {
                                                 break;
@@ -349,50 +392,45 @@ async fn handle_events(
                                                         record_keeper.records.pop()
                                                     }
                                                 };
-                                                text = String::new();
-                                                command_suggestions = VecDeque::new();
-                                                let pos = position().unwrap();
-                                                let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
                                                 if let Some(v) = rec {
-                                                    println!("> {} record removed.", v.update_type.text());
+                                                    let disp = format!("> {} record removed.", v.update_type.text());
+                                                    display_line_to_user(&disp);
                                                 }
+                                            }
+                                            Command::WIN1 => {
+                                                record_keeper.add_winner_update(mpv, 1);
+                                                display_line_to_user("Player 1 declared winner");
+                                                break;
+                                            }
+                                            Command::WIN2 => {
+                                                record_keeper.add_winner_update(mpv, 2);
+                                                display_line_to_user("Player 2 declared winner");
+                                                break;
                                             }
                                             _ => {
                                             }
                                         }
-                                    }
-                                };
-                            // Anything else
-                            } else {
-                                let autocomplete_result = get_user_input_for_autocomplete(&card_db.cards, &text, &card_suggestions, key);
-                                match autocomplete_result {
-                                    AutocompleteResult::Continue{
-                                        text: new_text,
-                                        suggestions: new_suggestions
-                                    } => {
-                                        text = new_text;
-                                        card_suggestions = new_suggestions;
-                                    },
-                                    AutocompleteResult::Finished(card) => {
-                                        if let Some(suggest) = card_suggestions.front() {
-                                            let pos = position().unwrap();
-                                            let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
-                                            println!("> {}", suggest.display);
-                                            record_keeper.add_card_update(&mpv, &card.name, card.pitch);
-                                            text = String::new();
-                                            card_suggestions = VecDeque::new();
-                                        }
-                                    }
+                                        text = String::new();
+                                        card_suggestions.reset();
+                                        command_suggestions.reset();
+                                        clear_line();
                                 }
-                            }
-                            let pos = position().unwrap();
-                            let _  = execute!(stdout(), MoveTo(0, pos.1), Clear(ClearType::CurrentLine));
 
+                            // Command suggestion update
+                            } else if is_command(&text) || (text.is_empty() && key.code == KeyCode::Char(':')) {
+                                text = command_suggestions.get_user_input_for_autocomplete(&text, key);
+                            // Card suggestion update
+                            } else {
+                                text = card_suggestions.get_user_input_for_autocomplete(&text, key);
+                            }
+
+                            clear_line();
+                            // Show user autocomplete
                             let display = {
-                                if let Some(suggest) = card_suggestions.front() {
+                                if let Some(suggest) = card_suggestions.current_suggestion() {
                                     let split = suggest.display.split_at(text.len());
                                     &format!("{}{}", split.0, split.1.grey())
-                                } else if let Some(suggest) = command_suggestions.front()  {
+                                } else if let Some(suggest) = command_suggestions.current_suggestion()  {
                                     let split = suggest.get_name().split_at(text.len());
                                     &format!("{}{}", split.0, split.1.grey())
                                 } else {
@@ -408,7 +446,11 @@ async fn handle_events(
                 };
             }
         }
-        if !text.is_empty() || !card_suggestions.is_empty() || !command_suggestions.is_empty() {
+
+        if !text.is_empty()
+            || card_suggestions.has_suggestions()
+            || command_suggestions.has_suggestions()
+        {
             if !mpv.get_property("pause").unwrap_or(true) {
                 let _ = mpv.pause();
             }
@@ -521,7 +563,7 @@ async fn main() -> std::io::Result<()> {
 
     execute!(&mut stdout())?;
 
-    handle_events(&output_fp, &mpv, &card_db, hero1, hero2, first.text()).await;
+    handle_events(&output_fp, &mpv, &card_db.cards, hero1, hero2, first.text()).await;
 
     disable_raw_mode()
 }

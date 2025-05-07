@@ -58,12 +58,14 @@ const TURN_FONT_THICKNESS: i32 = 2;
 const HERO_OFFSET_RATIO: f64 = 1.0 / 256.0;
 const HERO_BORDER_THICKNESS: i32 = 5;
 const HERO_TURN_COLOR: Scalar = Scalar::new(0.0, 100.0, 255.0, 0.0);
+const HERO_WIN_COLOR: Scalar = Scalar::new(0.0, 255.0, 0.0, 0.0);
 const HERO_DEF_COLOR: Scalar = Scalar::new(0.0, 0.0, 0.0, 0.0);
 
 // Life
 const LIFE_TICK: f64 = 250.0;
 
 // File Constants
+const LIFE_DATA_TYPE: &str = "life";
 const CARD_DATA_TYPE: &str = "card";
 const TURN_DATA_TYPE: &str = "turn";
 
@@ -380,6 +382,7 @@ fn main() -> Result<()> {
     let mut time_tick = TimeTick::new();
     let mut display_card: VecDeque<DataRow> = VecDeque::new();
     let mut card_image = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+    let mut winner: Option<u8> = None;
 
     // Track what the players lives should be so we can tick them down
     let mut player1_life_tracker = LifeTracker::build(&hero1_stats.player1_life.unwrap());
@@ -500,7 +503,9 @@ fn main() -> Result<()> {
         let mut hero1_roi = frame.roi_mut(hero1_rect)?;
         let _ = hero1_image.copy_to(hero1_roi.borrow_mut());
         let hero1_color = {
-            if turn_player == TurnPlayer::One {
+            if winner.is_some_and(|v| v == 1) {
+                HERO_WIN_COLOR
+            } else if turn_player == TurnPlayer::One {
                 HERO_TURN_COLOR
             } else {
                 HERO_DEF_COLOR
@@ -524,7 +529,9 @@ fn main() -> Result<()> {
         let mut hero2_roi = frame.roi_mut(hero2_rect)?;
         let _ = hero2_image.copy_to(hero2_roi.borrow_mut());
         let hero2_color = {
-            if turn_player == TurnPlayer::Two {
+            if winner.is_some_and(|v| v == 2) {
+                HERO_WIN_COLOR
+            } else if turn_player == TurnPlayer::Two {
                 HERO_TURN_COLOR
             } else {
                 HERO_DEF_COLOR
@@ -541,12 +548,6 @@ fn main() -> Result<()> {
 
         // Update life totals
         if life_ticker == 0 {
-            // if player1_display_life != player1_life {
-            //     player1_display_life += (player1_life - player1_display_life).signum();
-            // }
-            // if player2_display_life != player2_life {
-            //     player2_display_life += (player2_life - player2_display_life).signum();
-            // }
             player1_life_tracker.tick_display();
             player2_life_tracker.tick_display();
         }
@@ -697,12 +698,18 @@ fn main() -> Result<()> {
                 } else if row.update_type == TURN_DATA_TYPE {
                     turn_counter += 1;
                     turn_player.swap_update(&first_turn_player);
-                } else {
+                } else if row.update_type == LIFE_DATA_TYPE {
                     if let Some(update) = row.player1_life {
                         player1_life_tracker.update(&update);
                     }
                     if let Some(update) = row.player2_life {
                         player2_life_tracker.update(&update);
+                    }
+                } else {
+                    if row.update_type == "win1" {
+                        let _ = winner.insert(1);
+                    } else {
+                        let _ = winner.insert(2);
                     }
                 }
             }
