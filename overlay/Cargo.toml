@@ -16,3 +16,4 @@ tokio = { version = "1.43.0", features = ["full"] }
 lib = { path = "../lib" }
 chrono = "0.4.40"
 indicatif = "0.17.11"
+tempfile = "3.20.0"

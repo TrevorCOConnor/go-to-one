@@ -20,16 +20,25 @@ impl Operation {
 pub struct LifeTracker {
     current: i32,
     display: i32,
+    ticker: u32,
+    ticker_max: u32,
 }
 
 impl LifeTracker {
-    pub fn build(starting_life: &str) -> Self {
+    /// # Arguments
+    /// * `starting_life` - String rep of the heros starting life
+    /// * `tick_rate` - How often the tracker should be updated
+    /// * `increment` - How much time elapses each frame
+    pub fn build(starting_life: &str, tick_rate: f64, increment: f64) -> Self {
         let value = starting_life
             .parse::<i32>()
             .expect("Starting life is not a number");
+        let ticker_max = (tick_rate / increment) as u32;
         LifeTracker {
             current: value,
             display: value,
+            ticker: 0,
+            ticker_max,
         }
     }
 
@@ -63,8 +72,13 @@ impl LifeTracker {
         self.current = new_value;
     }
 
+    /// Ticks display life by one increment
     pub fn tick_display(&mut self) {
-        self.display += (self.current - self.display).signum();
+        self.ticker += 1;
+        if self.ticker == self.ticker_max {
+            self.ticker = 0;
+            self.display += (self.current - self.display).signum();
+        }
     }
 
     pub fn display(&self) -> String {

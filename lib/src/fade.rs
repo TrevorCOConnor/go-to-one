@@ -107,6 +107,50 @@ pub fn overlay_image_sectional_with_removal(
     Ok(background)
 }
 
+pub fn overlay_image_roi_sectional_with_removal(
+    background: &UMat,
+    smaller: &UMat,
+    target_color: &Scalar,
+    pixels: i32,
+    threshold: f64,
+    roi: Rect,
+) -> Result<UMat, Box<dyn std::error::Error>> {
+    let mut smaller = smaller.clone();
+    let mut section = UMat::new_size_def(roi.size(), background.typ()).unwrap();
+
+    let height = roi.height;
+    let width = roi.width;
+
+    for y in 0..height.div_euclid(pixels) {
+        for x in 0..width.div_euclid(pixels) {
+            let total_roi_width = width - pixels * x;
+            let total_roi_height = height - pixels * y;
+
+            let roi_width = pixels.min(total_roi_width);
+            let roi_height = pixels.min(total_roi_height);
+
+            let background_rect = Rect::new(
+                roi.x + pixels * x,
+                roi.y + pixels * y,
+                roi_width,
+                roi_height,
+            );
+            let background_roi_clone = background.roi(background_rect)?.try_clone()?;
+            let smaller_rect = Rect::new(pixels * x, pixels * y, roi_width, roi_height);
+
+            let foreground_roi = smaller.roi_mut(smaller_rect)?;
+
+            let fade_factor = determine_region_fade_percentage(&foreground_roi, target_color)?;
+            if fade_factor > threshold {
+                foreground_roi.copy_to(&mut section)?;
+            } else {
+                background_roi_clone.copy_to(&mut section)?;
+            }
+        }
+    }
+    Ok(section)
+}
+
 pub fn remove_color(
     background: &UMat,
     foreground: &UMat,

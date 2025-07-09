@@ -1,0 +1,52 @@
+// use lib::{
+//     coord::Coord,
+//     err::RoiError,
+//     image::{get_card_art_progressive, ProgressionFunction},
+// };
+// use opencv::{
+//     core::{Rect, UMat, UMatTraitConst},
+//     flann::LINEAR,
+// };
+
+// /// LINEAR
+// fn linear_move(start: Coord, end: Coord, percentage: f64) -> Coord {
+//     end - start.scale(1.0 - percentage)
+// }
+
+// /// All functions that can be used to move an image
+// /// LINEAR: Straight line with constant speed
+// enum MoveFunction {
+//     LINEAR,
+// }
+
+// impl MoveFunction {
+//     fn apply(&self, start: Coord, end: Coord, percentage: f64) -> Coord {
+//         match self {
+//             MoveFunction::LINEAR => linear_move(start, end, percentage),
+//         }
+//     }
+// }
+
+// /// Moves the hero from `start_location` to `end_location` using the specified functions.
+// fn move_umat(
+//     start_location: (i32, i32),
+//     end_location: (i32, i32),
+//     img: &UMat,
+//     frame: &UMat,
+//     percentage: f64,
+//     move_func: MoveFunction,
+// ) -> Result<(), Box<dyn std::error::Error>> {
+//     // generate coordinates
+//     let start_coord = Coord::from_i32_i32(start_location.0, start_location.1);
+//     let end_coord = Coord::from_i32_i32(end_location.0, end_location.1);
+
+//     // calculate new location
+//     let location = move_func.apply(start_coord, end_coord, percentage);
+
+//     // Check that ROI is valid
+//     if frame.rows() < location.x() as i32 + img.rows() {
+//         return Err(Box::new(RoiError::TooWide));
+//     }
+
+//     Ok(())
+// }

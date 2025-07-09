@@ -1,10 +1,9 @@
 use csv::StringRecord;
 use log::warn;
 use opencv::{
-    core::{MatTraitConst, UMat, UMatTrait, UMatTraitConst, Vector, CV_8U},
+    core::{MatTraitConst, UMat, UMatTraitConst, Vector, CV_8U},
     imgcodecs::{imdecode, IMREAD_UNCHANGED},
     imgproc::{cvt_color_def, COLOR_RGBA2RGB},
-    rgbd::rescale_depth_def,
 };
 
 /// This may need to be replaced with an actual DB at some point

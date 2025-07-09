@@ -5,14 +5,16 @@ use lib::{
     fade::{remove_color, remove_white_corners},
     image::get_card_art,
     life_tracker::LifeTracker,
+    relative_roi::{HorizontalPartition, RelativeRoi, VerticalPartition},
     rotate::rotate_image,
+    text::center_text_at,
 };
 use opencv::{
-    core::{self, MatTraitConst, Point, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
+    core::{self, bitwise_not_def, MatTraitConst, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
     imgcodecs,
     imgproc::{
-        self, get_text_size, put_text, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX, LINE_8,
-        LINE_AA,
+        self, cvt_color_def, COLOR_BGR2GRAY, COLOR_GRAY2RGB, FONT_HERSHEY_SCRIPT_COMPLEX,
+        FONT_HERSHEY_SIMPLEX, LINE_8,
     },
     videoio::{
         self, VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst, VideoWriter,
@@ -20,7 +22,8 @@ use opencv::{
     },
 };
 use serde::Deserialize;
-use std::{borrow::BorrowMut, collections::VecDeque, error, ops::Sub};
+use std::{borrow::BorrowMut, collections::VecDeque, error, ops::Sub, process::Command};
+use tempfile::NamedTempFile;
 
 // Card display
 const FADE_IN_DURATION: f64 = 0.75;
@@ -29,15 +32,15 @@ const EXTENDED_DISPLAY_DURATION: f64 = 12.0;
 const FADE_OUT_DURATION: f64 = 0.75;
 
 // Constants
-const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
+// const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
 const CARD_HEIGHT_RATIO: f64 = 628.0 / 450.0;
 const MILLI: f64 = 1_000.0;
 
 // Background
-const BACKGROUND_ANIM_FILE: &'static str = "data/199621-910995780.mp4";
+const BACKGROUND_ANIM_FILE: &'static str = "data/hexagon.mp4";
 
 // Frame dimensions
-const FRAME_WIDTH_RATIO: f64 = 1.0 - (1.0 / 64.0);
+// const FRAME_WIDTH_RATIO: f64 = 1.0 - (1.0 / 64.0);
 const FRAME_HEIGHT_RATIO: f64 = 1.0 - (1.0 / 64.0);
 
 // Scoreboard dimensions
@@ -50,12 +53,12 @@ const SCORE_FONT_SCALE: f64 = 1.75;
 const SCORE_FONT_STYLE: i32 = FONT_HERSHEY_SCRIPT_COMPLEX;
 const SCORE_FONT_WIDTH: i32 = 3;
 
-const TURN_FONT_SCALE: f64 = 1.0;
+const TURN_FONT_SCALE: f64 = 1.75;
 const TURN_FONT_FACE: i32 = FONT_HERSHEY_SIMPLEX;
-const TURN_FONT_THICKNESS: i32 = 2;
+const TURN_FONT_THICKNESS: i32 = 3;
 
 // Heros
-const HERO_OFFSET_RATIO: f64 = 1.0 / 256.0;
+// const HERO_OFFSET_RATIO: f64 = 1.0 / 256.0;
 const HERO_BORDER_THICKNESS: i32 = 5;
 const HERO_TURN_COLOR: Scalar = Scalar::new(0.0, 100.0, 255.0, 0.0);
 const HERO_WIN_COLOR: Scalar = Scalar::new(0.0, 255.0, 0.0, 0.0);
@@ -210,6 +213,48 @@ impl TurnPlayer {
     }
 }
 
+struct VideoCapLooper {
+    fp: String,
+    cap: VideoCapture,
+}
+
+impl VideoCapLooper {
+    fn build(video_fp: &str) -> Result<Self> {
+        let cap = VideoCapture::from_file_def(video_fp)?;
+        Ok(Self {
+            fp: video_fp.to_owned(),
+            cap,
+        })
+    }
+
+    fn read(&mut self) -> Result<UMat> {
+        let mut frame = UMat::new_def();
+        let got = self.cap.read(&mut frame)?;
+        if !got {
+            self.cap = VideoCapture::from_file_def(&self.fp)?;
+            self.cap.read(&mut frame)?;
+        }
+
+        // HACK
+        let mut inverted_frame = UMat::new_def();
+        bitwise_not_def(&frame, &mut inverted_frame)?;
+        cvt_color_def(&inverted_frame, &mut frame, COLOR_BGR2GRAY)?;
+        // cvt_color_def(&frame, &mut inverted_frame, COLOR_RGB2BGR)?;
+        cvt_color_def(&frame, &mut inverted_frame, COLOR_GRAY2RGB)?;
+
+        Ok(inverted_frame)
+    }
+}
+
+/// Loads image to UMat
+fn load_image(fp: &str) -> Result<UMat> {
+    let mut umat = UMat::new_def();
+    let img = imgcodecs::imread(fp, imgcodecs::IMREAD_COLOR)?;
+    img.copy_to(&mut umat)?;
+
+    Ok(umat)
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -264,6 +309,8 @@ fn main() -> Result<()> {
             format!("output_videos/{}_output_video.mp4", chrono::Local::now())
         }
     };
+    let tmp_file = NamedTempFile::new()?;
+    let tmp_path = tmp_file.path().to_str().unwrap();
 
     // Create capture
     let mut cap = VideoCapture::from_file(&args.video_file, videoio::CAP_ANY)?;
@@ -272,7 +319,7 @@ fn main() -> Result<()> {
     let fps = cap.get(videoio::CAP_PROP_FPS)?;
 
     // Create background capture
-    let mut background_cap = VideoCapture::from_file(BACKGROUND_ANIM_FILE, videoio::CAP_ANY)?;
+    let mut background_loop = VideoCapLooper::build(&BACKGROUND_ANIM_FILE)?;
 
     let font_scale = { original_width / 1920.0 };
 
@@ -293,20 +340,95 @@ fn main() -> Result<()> {
         original_width
     };
 
+    let frame_size = Size::new(frame_width as i32, frame_height as i32);
+
     // Scoreboard dimensions
     let scoreboard_width = (frame_width * SCOREBOARD_WIDTH_RATIO) as i32;
-    let scoreboard_width_buffer = (frame_width * SCOREBOARD_WIDTH_BUFFER_RATIO) as i32;
-    let scoreboard_height_buffer = (frame_height * SCOREBOARD_HEIGHT_BUFFER_RATIO) as i32;
-    let scoreboard_height = (frame_height as i32) - 5 * scoreboard_height_buffer;
 
-    // Innerframe dimensions
-    let innerframe_width = ((frame_width - scoreboard_width as f64) * FRAME_WIDTH_RATIO) as i32;
+    // Relative dimensions
+    let innerframe_rel_roi = RelativeRoi::build_as_partition(
+        SCOREBOARD_WIDTH_RATIO,
+        0.0,
+        1.0 - SCOREBOARD_WIDTH_RATIO,
+        1.0,
+        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
+        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        Some(HorizontalPartition::Right),
+        None,
+    )?;
+    let turn_counter_rel_roi = RelativeRoi::build(
+        1.0 - 1.0 / 10.0,
+        0.,
+        1.0 / 10.0,
+        1.0 / 10.0,
+        Some(SCOREBOARD_WIDTH_BUFFER_RATIO + 1.0 / 300.0),
+        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO + 1.0 / 200.0),
+    )?;
+    let card_rel_roi = RelativeRoi::build_as_partition(
+        0.0,
+        0.5,
+        SCOREBOARD_WIDTH_RATIO,
+        0.5,
+        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
+        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        Some(HorizontalPartition::Left),
+        Some(VerticalPartition::Bottom),
+    )?;
+    let logo_rel_roi = RelativeRoi::build_as_partition(
+        0.0,
+        0.0,
+        SCOREBOARD_WIDTH_RATIO,
+        3.0 / 12.0,
+        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
+        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        Some(HorizontalPartition::Left),
+        Some(VerticalPartition::Top),
+    )?;
+    let hero1_rel_roi = RelativeRoi::build_as_partition(
+        0.,
+        4.0 / 12.0,
+        SCOREBOARD_WIDTH_RATIO / 2.0,
+        2.0 / 12.0,
+        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
+        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        Some(HorizontalPartition::Left),
+        Some(VerticalPartition::Center),
+    )?;
+    let hero2_rel_roi = RelativeRoi::build_as_partition(
+        SCOREBOARD_WIDTH_RATIO / 2.0,
+        4.0 / 12.0,
+        SCOREBOARD_WIDTH_RATIO / 2.0,
+        2.0 / 12.0,
+        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
+        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        Some(HorizontalPartition::Center),
+        Some(VerticalPartition::Center),
+    )?;
+    let left_text_rel_roi = RelativeRoi::build_as_partition(
+        0.0,
+        3.0 / 12.0,
+        SCOREBOARD_WIDTH_RATIO / 2.0,
+        1.0 / 12.0,
+        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
+        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        Some(HorizontalPartition::Left),
+        Some(VerticalPartition::Center),
+    )?;
+    let right_text_rel_roi = RelativeRoi::build_as_partition(
+        SCOREBOARD_WIDTH_RATIO / 2.0,
+        3.0 / 12.0,
+        SCOREBOARD_WIDTH_RATIO / 2.0,
+        1.0 / 12.0,
+        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
+        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        Some(HorizontalPartition::Center),
+        Some(VerticalPartition::Center),
+    )?;
 
     // Get hero images
     let hero1_image = card_image_db.load_card_image(&hero1_stats.name, &None);
     let hero2_image = card_image_db.load_card_image(&hero2_stats.name, &None);
 
-    // let hero_width = ((scoreboard_width as f64) * (3.0 / 4.0)) as i32;
     let hero_width = ((scoreboard_width as f64) * 0.5) as i32;
     let hero_length = (CARD_HEIGHT_RATIO * (hero_width as f64)) as i32;
     let hero1_image =
@@ -315,16 +437,14 @@ fn main() -> Result<()> {
         get_card_art(&hero2_image, hero_width, hero_length).expect("Could not load hero2 image");
 
     // Card dimensions
-    let card_height = scoreboard_height / 2;
-    let card_width = ((card_height as f64) * CARD_WIDTH_RATIO) as i32;
-    let y_offset = 4 * scoreboard_height_buffer + 3 * (scoreboard_height / 6);
-    let card_rect = core::Rect::new(scoreboard_width_buffer, y_offset, card_width, card_height);
+    let card_rect = card_rel_roi.generate_roi_raw(&frame_size);
 
     // Adjust cardback and prevent further mutations
     opencv::imgproc::resize(
         &card_back_img.clone(),
         &mut card_back_img,
-        Size::new(card_width, card_height),
+        // Size::new(card_width, card_height),
+        Size::new(card_rect.width, card_rect.height),
         0.0,
         0.0,
         opencv::imgproc::INTER_LINEAR,
@@ -335,44 +455,27 @@ fn main() -> Result<()> {
 
     // Generate output video
     let mut out = VideoWriter::new(
-        &output_path,
+        &tmp_path,
         VideoWriter::fourcc('m', 'p', '4', 'v').unwrap(),
         fps,
         Size::new(frame_width as i32, frame_height as i32),
         true,
     )?;
 
-    // load GoToOne Logo
-    let _logo_image = imgcodecs::imread(&LOGO_FP, imgcodecs::IMREAD_COLOR).unwrap();
-    let mut logo_image = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-    _logo_image.copy_to(&mut logo_image)?;
-    let logo_ratio = logo_image.rows() as f32 / logo_image.cols() as f32;
-    let new_logo_height = 2 * (scoreboard_height / 6) - 2 * scoreboard_height_buffer;
-    let new_logo_width = ((new_logo_height as f32) * logo_ratio) as i32;
-    let logo_offset = (scoreboard_width - new_logo_width - scoreboard_width_buffer).div_euclid(2);
-    opencv::imgproc::resize(
-        &logo_image.clone(),
-        &mut logo_image,
-        Size::new(new_logo_width, new_logo_height),
-        0.0,
-        0.0,
-        opencv::imgproc::INTER_LINEAR,
-    )?;
-    let logo_rect = core::Rect::new(
-        logo_offset,
-        scoreboard_height_buffer,
-        new_logo_width,
-        new_logo_height,
-    );
+    // Load GoToOne Logo
+    let logo_image = load_image(&LOGO_FP)?;
+    let mut logo_image = logo_rel_roi.resize(&frame_size, &logo_image)?;
+    let logo_roi = logo_rel_roi.generate_roi(&frame_size, &logo_image);
     imgproc::rectangle(
         &mut logo_image,
-        core::Rect::new(0, 0, new_logo_width, new_logo_height),
+        core::Rect::new(0, 0, logo_roi.width, logo_roi.height),
         Scalar::new(0., 0., 0., 0.),
         (HERO_BORDER_THICKNESS as f64 * 2.0 * font_scale) as i32,
         imgproc::LINE_8,
         0,
     )?;
 
+    // stop further mutations
     let logo_image = logo_image;
 
     // Set init vars
@@ -385,11 +488,10 @@ fn main() -> Result<()> {
     let mut winner: Option<u8> = None;
 
     // Track what the players lives should be so we can tick them down
-    let mut player1_life_tracker = LifeTracker::build(&hero1_stats.player1_life.unwrap());
-    let mut player2_life_tracker = LifeTracker::build(&hero2_stats.player2_life.unwrap());
-
-    let mut life_ticker = 0;
-    let life_ticker_mod = (LIFE_TICK / increment) as u32;
+    let mut player1_life_tracker =
+        LifeTracker::build(&hero1_stats.player1_life.unwrap(), LIFE_TICK, increment);
+    let mut player2_life_tracker =
+        LifeTracker::build(&hero2_stats.player2_life.unwrap(), LIFE_TICK, increment);
 
     let mut turn_counter = 0_u32;
     let mut card_back = true;
@@ -416,8 +518,8 @@ fn main() -> Result<()> {
         time_tick.increment_milli(increment);
 
         // Increment life ticker
-        life_ticker += 1;
-        life_ticker = life_ticker % life_ticker_mod;
+        player1_life_tracker.tick_display();
+        player2_life_tracker.tick_display();
 
         // Grab frame
         if !cap.read(&mut frame).unwrap_or(false) {
@@ -425,14 +527,9 @@ fn main() -> Result<()> {
         }
 
         // Draw background
-        // Hack, baby!
-        let mut background_frame = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-        if !background_cap.read(&mut background_frame).unwrap_or(false) {
-            background_cap = VideoCapture::from_file(BACKGROUND_ANIM_FILE, videoio::CAP_ANY)?;
-            background_cap.read(&mut background_frame).unwrap();
-        }
+        let background_frame = background_loop.read()?;
 
-        let mut background = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+        let mut background = UMat::new_def();
         opencv::imgproc::resize(
             &background_frame,
             &mut background,
@@ -454,54 +551,32 @@ fn main() -> Result<()> {
             frame_width as i32 - (crop_left + crop_right),
             ((frame_height - (crop_top + crop_bottom) as f64) * FRAME_HEIGHT_RATIO) as i32,
         ))?;
+        let mut innerframe = UMat::new_def();
+        crop_roi.copy_to(&mut innerframe)?;
 
-        let new_ratio = crop_roi.cols() as f64 / crop_roi.rows() as f64;
-        let innerframe_height = std::cmp::min(
-            (innerframe_width as f64 * new_ratio.recip()) as i32,
-            (frame_height * FRAME_WIDTH_RATIO) as i32,
-        );
-        let innerframe_width = (new_ratio * innerframe_height as f64) as i32;
-
-        // place frame in background
-        let mut innerframe = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-        opencv::imgproc::resize(
-            &crop_roi,
-            &mut innerframe,
-            Size::new(innerframe_width, innerframe_height),
-            0.0,
-            0.0,
-            opencv::imgproc::INTER_AREA,
-        )?;
-        let frame_rect = core::Rect::new(
-            scoreboard_width,
-            (frame_height as i32 - innerframe_height).div_euclid(2),
-            innerframe_width,
-            innerframe_height as i32,
-        );
-        let mut frame_roi = background.roi_mut(frame_rect)?;
-        let _ = innerframe.copy_to(frame_roi.borrow_mut());
-        let _ = imgproc::rectangle(
+        let reframe = innerframe_rel_roi.resize(&frame_size, &innerframe)?;
+        let frame_roi_rect = innerframe_rel_roi.generate_roi(&frame_size, &innerframe);
+        let mut frame_roi = background.roi_mut(frame_roi_rect)?;
+        // let mut frame_roi = background.roi_mut(frame_rect)?;
+        reframe.copy_to(frame_roi.borrow_mut())?;
+        imgproc::rectangle(
             &mut background,
-            frame_rect,
+            frame_roi_rect,
             Scalar::new(0.0, 0.0, 0.0, 0.0),
             10, // Thickness of -1 fills the rectangle completely
             LINE_8,
             0,
-        );
+        )?;
 
         // quick fix
         frame = background;
 
         // Heroes
-        let hero_x_offset = (HERO_OFFSET_RATIO * frame_width) as i32;
-        let hero1_rect = core::Rect::new(
-            hero_x_offset,
-            2 * (scoreboard_height / 6) + 3 * (scoreboard_height_buffer),
-            hero1_image.cols(),
-            hero1_image.rows(),
-        );
+        let hero1_rect = hero1_rel_roi.generate_roi(&frame_size, &hero1_image);
+        let hero1_image = hero1_rel_roi.resize(&frame_size, &hero1_image)?;
+
         let mut hero1_roi = frame.roi_mut(hero1_rect)?;
-        let _ = hero1_image.copy_to(hero1_roi.borrow_mut());
+        hero1_image.copy_to(hero1_roi.borrow_mut())?;
         let hero1_color = {
             if winner.is_some_and(|v| v == 1) {
                 HERO_WIN_COLOR
@@ -520,14 +595,12 @@ fn main() -> Result<()> {
             0,
         )?;
 
-        let hero2_rect = core::Rect::new(
-            hero1_image.cols() + 2 * hero_x_offset,
-            2 * (scoreboard_height / 6) + 3 * (scoreboard_height_buffer),
-            hero2_image.cols(),
-            hero2_image.rows(),
-        );
+        let hero2_rect = hero2_rel_roi.generate_roi(&frame_size, &hero2_image);
+        let hero2_image = hero2_rel_roi.resize(&frame_size, &hero2_image)?;
+
         let mut hero2_roi = frame.roi_mut(hero2_rect)?;
-        let _ = hero2_image.copy_to(hero2_roi.borrow_mut());
+        hero2_image.copy_to(hero2_roi.borrow_mut())?;
+
         let hero2_color = {
             if winner.is_some_and(|v| v == 2) {
                 HERO_WIN_COLOR
@@ -546,38 +619,13 @@ fn main() -> Result<()> {
             0,
         )?;
 
-        // Update life totals
-        if life_ticker == 0 {
-            player1_life_tracker.tick_display();
-            player2_life_tracker.tick_display();
-        }
+        let left_rect = left_text_rel_roi.generate_roi_raw(&frame_size);
+        let right_rect = right_text_rel_roi.generate_roi_raw(&frame_size);
 
-        let mut baseline = 0;
-        let text_size = get_text_size(
-            "40",
-            SCORE_FONT_STYLE,
-            SCORE_FONT_SCALE * font_scale,
-            SCORE_FONT_WIDTH * font_scale as i32,
-            &mut baseline,
-        )?;
-
-        let text_offset =
-            (scoreboard_width.div_euclid(2) - (2 * scoreboard_width_buffer) - text_size.width)
-                .div_euclid(2);
-
-        let text_height_buffer = ((text_size.height as f64) * 0.2) as i32;
-
-        // Draw rectangle behind life totals
-        let score_rect = core::Rect::new(
-            scoreboard_width_buffer,
-            9 * (scoreboard_height / 24) - text_size.height - text_height_buffer,
-            scoreboard_width - 2 * scoreboard_width_buffer,
-            text_size.height + 2 * text_height_buffer,
-        );
         let mut overlay = frame.clone();
         imgproc::rectangle(
             &mut overlay,
-            score_rect,
+            left_rect,
             Scalar::new(0., 0., 0., 0.),
             -1,
             imgproc::LINE_8,
@@ -585,93 +633,61 @@ fn main() -> Result<()> {
         )?;
         core::add_weighted(&overlay, 0.5, &frame.clone(), 0.5, 0., &mut frame, -1)?;
 
-        // Player1 Life
-        put_text(
+        let mut overlay = frame.clone();
+        imgproc::rectangle(
+            &mut overlay,
+            right_rect,
+            Scalar::new(0., 0., 0., 0.),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+        core::add_weighted(&overlay, 0.5, &frame.clone(), 0.5, 0., &mut frame, -1)?;
+
+        center_text_at(
             &mut frame,
             &player1_life_tracker.display(),
-            Point::new(
-                text_offset + scoreboard_width_buffer,
-                9 * (scoreboard_height / 24),
-            ),
             SCORE_FONT_STYLE,
-            SCORE_FONT_SCALE * font_scale,
+            SCORE_FONT_SCALE,
             Scalar::new(255.0, 255.0, 255.0, 0.0),
-            SCORE_FONT_WIDTH * font_scale as i32,
-            LINE_AA,
-            false,
+            SCORE_FONT_WIDTH,
+            left_text_rel_roi,
+            20,
         )?;
-        // Player2 Life
-        put_text(
+        center_text_at(
             &mut frame,
             &player2_life_tracker.display(),
-            Point::new(
-                scoreboard_width / 2 + text_offset + scoreboard_width_buffer,
-                9 * (scoreboard_height / 24),
-            ),
             SCORE_FONT_STYLE,
-            SCORE_FONT_SCALE * font_scale,
+            SCORE_FONT_SCALE,
             Scalar::new(255.0, 255.0, 255.0, 0.0),
-            SCORE_FONT_WIDTH * font_scale as i32,
-            LINE_AA,
-            false,
+            SCORE_FONT_WIDTH,
+            right_text_rel_roi,
+            20,
         )?;
-
-        // Draw line between player lives
-        let _ = imgproc::line(
-            &mut frame,
-            Point::new(
-                scoreboard_width / 2,
-                9 * (scoreboard_height / 24) - text_size.height,
-            ),
-            Point::new(scoreboard_width / 2, 9 * (scoreboard_height / 24)),
-            Scalar::new(255.0, 255.0, 255.0, 255.0),
-            SCORE_FONT_WIDTH * font_scale as i32,
-            LINE_AA,
-            0,
-        );
 
         // Turn counter
         if turn_counter > 0 {
-            let mut baseline = 0;
-            let text_size = get_text_size(
-                "Turn 10",
-                TURN_FONT_FACE,
-                TURN_FONT_SCALE * font_scale,
-                TURN_FONT_THICKNESS * font_scale as i32,
-                &mut baseline,
-            )?;
-            let turn_counter_rect = core::Rect::new(
-                (frame_width as i32) - text_size.width - 2 * scoreboard_width_buffer,
-                0,
-                text_size.width + 2 * scoreboard_width_buffer,
-                text_size.height + 2 * scoreboard_height_buffer,
-            );
-
-            let _ = imgproc::rectangle(
+            imgproc::rectangle(
                 &mut frame,
-                turn_counter_rect,
+                turn_counter_rel_roi.generate_roi_raw(&frame_size),
                 Scalar::new(0., 0., 0., 0.),
                 -1,
                 imgproc::LINE_8,
                 0,
-            );
-            let _ = put_text(
+            )?;
+            center_text_at(
                 &mut frame,
                 &format!("Turn {}", turn_counter),
-                Point::new(
-                    (frame_width as i32) - text_size.width - scoreboard_width_buffer,
-                    text_size.height + scoreboard_height_buffer,
-                ),
                 TURN_FONT_FACE,
-                TURN_FONT_SCALE * font_scale,
+                TURN_FONT_SCALE,
                 Scalar::new(255.0, 255.0, 255.0, 0.0),
-                TURN_FONT_THICKNESS * font_scale as i32,
-                LINE_AA,
-                false,
-            );
+                TURN_FONT_THICKNESS,
+                turn_counter_rel_roi,
+                20,
+            )?;
         }
 
-        let mut logo_roi = frame.roi_mut(logo_rect)?;
+        let mut logo_roi = frame.roi_mut(logo_roi)?;
         logo_image.copy_to(logo_roi.borrow_mut())?;
 
         // Rotate frame if necessary
@@ -784,7 +800,8 @@ fn main() -> Result<()> {
                 opencv::imgproc::resize(
                     &card_image.clone(),
                     &mut card_image,
-                    Size::new(card_width, card_height),
+                    // Size::new(card_width, card_height),
+                    card_rect.size(),
                     0.0,
                     0.0,
                     opencv::imgproc::INTER_LINEAR,
@@ -804,8 +821,8 @@ fn main() -> Result<()> {
 
                         let rotated = rotate_image(&card, alpha as f32, true)?;
                         let rotated_rect = core::Rect::new(
-                            scoreboard_width_buffer,
-                            y_offset - (rotated.rows() - card_height).div_euclid(2),
+                            card_rect.x,
+                            card_rect.y - (rotated.rows() - card_rect.height).div_euclid(2),
                             rotated.cols(),
                             rotated.rows(),
                         );
@@ -840,8 +857,8 @@ fn main() -> Result<()> {
 
                         let rotated = rotate_image(&card, alpha as f32, false)?;
                         let rotated_rect = core::Rect::new(
-                            scoreboard_width_buffer,
-                            y_offset - (rotated.rows() - card_height).div_euclid(2),
+                            card_rect.x,
+                            card_rect.y - (rotated.rows() - card_rect.height).div_euclid(2),
                             rotated.cols(),
                             rotated.rows(),
                         );
@@ -877,8 +894,8 @@ fn main() -> Result<()> {
                         let card = remove_white_corners(&green, &card_image)?;
                         let rotated = rotate_image(&card, alpha as f32, true)?;
                         let rotated_rect = core::Rect::new(
-                            scoreboard_width_buffer,
-                            y_offset - (rotated.rows() - card_height).div_euclid(2),
+                            card_rect.x,
+                            card_rect.y - (rotated.rows() - card_rect.height).div_euclid(2),
                             rotated.cols(),
                             rotated.rows(),
                         );
@@ -907,8 +924,8 @@ fn main() -> Result<()> {
                         let card = remove_white_corners(&green, &card_back_img)?;
                         let rotated = rotate_image(&card, alpha as f32, false)?;
                         let rotated_rect = core::Rect::new(
-                            scoreboard_width_buffer,
-                            y_offset - (rotated.rows() - card_height).div_euclid(2),
+                            card_rect.x,
+                            card_rect.y - (rotated.rows() - card_rect.height).div_euclid(2),
                             rotated.cols(),
                             rotated.rows(),
                         );
@@ -953,6 +970,28 @@ fn main() -> Result<()> {
 
     // end progress bar
     bar.finish();
+    out.release()?;
+
+    println!("Adding audio...");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&[
+        "-i",
+        &tmp_path,
+        "-i",
+        &args.video_file,
+        "-c",
+        "copy",
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-shortest",
+        &output_path,
+        "-y",
+    ]);
+
+    cmd.output()?;
+    println!("Finished!");
 
     Ok(())
 }

@@ -1,7 +1,11 @@
 pub mod autocomplete;
 pub mod card;
 pub mod commands;
+pub mod coord;
+pub mod err;
 pub mod fade;
 pub mod image;
 pub mod life_tracker;
+pub mod relative_roi;
 pub mod rotate;
+pub mod text;
