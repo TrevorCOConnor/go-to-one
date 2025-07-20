@@ -934,6 +934,7 @@ dependencies = [
  "opencv",
  "reqwest",
  "serde",
+ "serde_json",
  "textwrap",
  "tokio",
 ]

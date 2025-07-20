@@ -2,19 +2,24 @@ use clap::Parser;
 use indicatif::ProgressBar;
 
 use lib::{
-    fade::{remove_color, remove_white_corners},
-    image::get_card_art,
+    card::CardImageDB,
+    fade::{convert_alpha_to_white, remove_color, remove_white_corners},
+    image::{load_image, load_image_unchanged, FullArtHeroManager},
+    intro::{generate_intro, VideoCapLooper, INTRO_TIME},
     life_tracker::LifeTracker,
-    relative_roi::{HorizontalPartition, RelativeRoi, VerticalPartition},
+    movement::{
+        place_umat, relocate_umat, resize_umat, safe_scale, straight_line, MoveFunction,
+        Reparameterization,
+    },
+    relative_roi::{center_offset, HorizontalPartition, RelativeRoi, VerticalPartition},
     rotate::rotate_image,
-    text::center_text_at,
+    text::{center_text_at_rect, center_text_at_rel},
 };
 use opencv::{
-    core::{self, bitwise_not_def, MatTraitConst, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
-    imgcodecs,
+    core::{self, flip, Point, Rect, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
     imgproc::{
-        self, cvt_color_def, COLOR_BGR2GRAY, COLOR_GRAY2RGB, FONT_HERSHEY_SCRIPT_COMPLEX,
-        FONT_HERSHEY_SIMPLEX, LINE_8,
+        self, cvt_color_def, COLOR_RGBA2RGB, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX,
+        LINE_8,
     },
     videoio::{
         self, VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst, VideoWriter,
@@ -26,32 +31,43 @@ use std::{borrow::BorrowMut, collections::VecDeque, error, ops::Sub, process::Co
 use tempfile::NamedTempFile;
 
 // Card display
-const FADE_IN_DURATION: f64 = 0.75;
 const DISPLAY_DURATION: f64 = 6.0;
 const EXTENDED_DISPLAY_DURATION: f64 = 12.0;
 const FADE_OUT_DURATION: f64 = 0.75;
+const ROTATE_TIME: f64 = 0.75;
+const ZOOM_TIME: f64 = 2.0;
+const ZOOM_DISPLAY: f64 = 3.0;
+const POST_ZOOM_TIME: f64 = 1.0;
 
 // Constants
-// const CARD_WIDTH_RATIO: f64 = 450.0 / 628.0;
-const CARD_HEIGHT_RATIO: f64 = 628.0 / 450.0;
 const MILLI: f64 = 1_000.0;
+const FRAME_WIDTH: i32 = 1920;
+const FRAME_HEIGHT: i32 = 1080;
+
+// Colors
+const GREEN: Scalar = Scalar::new(0.0, 255.0, 0.0, 0.0);
+const WHITE: Scalar = Scalar::new(255.0, 255.0, 255.0, 0.0);
 
 // Background
 const BACKGROUND_ANIM_FILE: &'static str = "data/hexagon.mp4";
 
 // Frame dimensions
-// const FRAME_WIDTH_RATIO: f64 = 1.0 - (1.0 / 64.0);
 const FRAME_HEIGHT_RATIO: f64 = 1.0 - (1.0 / 64.0);
 
 // Scoreboard dimensions
 const SCOREBOARD_WIDTH_RATIO: f64 = 0.2;
-const SCOREBOARD_HEIGHT_BUFFER_RATIO: f64 = 0.02;
-const SCOREBOARD_WIDTH_BUFFER_RATIO: f64 = 0.01;
+
+// Relative dimensions
+const TOP_PANEL_HEIGHT_RATIO: f64 = 1.0 / 8.0;
+const WIDTH_BUFFER_RATIO: f64 = 1.0 / 100.0;
+const HEIGHT_BUFFER_RATIO: f64 = 1.0 / 100.0;
+const SIDE_PANEL_WIDTH_RATIO: f64 = 1.0 / 5.0;
+const LIFE_SYMBOL_WIDTH_RATIO: f64 = 1.0 / 30.0;
 
 // Fonts
-const SCORE_FONT_SCALE: f64 = 1.75;
+const SCORE_FONT_SCALE: f64 = 10.0;
 const SCORE_FONT_STYLE: i32 = FONT_HERSHEY_SCRIPT_COMPLEX;
-const SCORE_FONT_WIDTH: i32 = 3;
+const SCORE_FONT_WIDTH: i32 = 10;
 
 const TURN_FONT_SCALE: f64 = 1.75;
 const TURN_FONT_FACE: i32 = FONT_HERSHEY_SIMPLEX;
@@ -71,15 +87,407 @@ const LIFE_TICK: f64 = 250.0;
 const LIFE_DATA_TYPE: &str = "life";
 const CARD_DATA_TYPE: &str = "card";
 const TURN_DATA_TYPE: &str = "turn";
+const ZOOM: &str = "zoom";
 
 // Logo
 const LOGO_FP: &str = "data/image.png";
 const CARD_BACK_FP: &str = "data/cardback.png";
+const LIFE_FP: &'static str = "data/life.png";
+
+enum CardDisplayPhase {
+    CardBackRotateOut,
+    CardFrontRotateIn,
+    Display,
+    Extended,
+    CardFrontRotateOut,
+    CardBackRotateIn,
+    Sleep,
+    ZoomIn,
+    ZoomDisplay,
+    ZoomOut,
+    PostZoom,
+}
+
+struct CardDisplayManager {
+    card_rect: Rect,
+    card_db: lib::card::CardImageDB,
+    card_back: UMat,
+    display_card: Option<UMat>,
+    phase: CardDisplayPhase,
+    queue: VecDeque<DataRow>,
+    timer: TimeTick,
+    zoom: bool,
+}
+
+impl CardDisplayManager {
+    fn queue_zoom(&mut self) {
+        self.queue.push_back(DataRow {
+            update_type: ZOOM.to_owned(),
+            ..Default::default()
+        });
+    }
+
+    fn add_card_to_queue(&mut self, card: DataRow) {
+        self.queue.push_back(card);
+    }
+
+    fn new(card_rect: &Rect, card_back: &UMat, time_tick: &TimeTick) -> Self {
+        let card_db = CardImageDB::init();
+        Self {
+            card_rect: card_rect.clone(),
+            card_db,
+            card_back: card_back.clone(),
+            display_card: None,
+            phase: CardDisplayPhase::Sleep,
+            queue: VecDeque::new(),
+            timer: time_tick.clone(),
+            zoom: false,
+        }
+    }
+
+    fn tick(&mut self, time_tick: TimeTick, frame: &mut UMat, frame_rect: &Rect) -> Result<()> {
+        let elapsed_time = (time_tick - self.timer).as_f64();
+
+        // Check for zoom
+        if self.queue.len() > 0 {
+            if self.queue.front().as_ref().unwrap().update_type == ZOOM {
+                self.queue.pop_front();
+                // ignore zooms not attached to a card
+                if self.display_card.is_some() {
+                    self.zoom = true;
+                }
+            }
+        }
+        match self.phase {
+            CardDisplayPhase::CardBackRotateOut => {
+                if elapsed_time >= ROTATE_TIME {
+                    self.timer = time_tick.clone();
+                    self.phase = CardDisplayPhase::CardFrontRotateIn;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let t = elapsed_time / ROTATE_TIME;
+                    let rotated = rotate_image(&self.card_back, t as f32, true)?;
+                    let rotated_rect = core::Rect::new(
+                        self.card_rect.x,
+                        self.card_rect.y
+                            - center_offset(self.card_rect.height, rotated.size()?.height),
+                        rotated.size()?.width,
+                        rotated.size()?.height,
+                    );
+
+                    let roi = &frame.roi(rotated_rect)?;
+
+                    let card_rotation =
+                        remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                    let mut inner_roi = frame.roi_mut(rotated_rect)?;
+                    card_rotation.copy_to(&mut inner_roi)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::CardFrontRotateIn => {
+                if elapsed_time >= ROTATE_TIME {
+                    self.timer = time_tick.clone();
+                    self.phase = CardDisplayPhase::Display;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let t = elapsed_time / ROTATE_TIME;
+                    let display_card = self.display_card.as_ref().unwrap();
+                    let green = UMat::new_size_with_default_def(
+                        display_card.size()?,
+                        display_card.typ(),
+                        GREEN,
+                    )?;
+                    let card = remove_white_corners(&green, &display_card)?;
+
+                    let rotated = rotate_image(&card, t as f32, false)?;
+                    let rotated_rect = core::Rect::new(
+                        self.card_rect.x,
+                        self.card_rect.y - (rotated.rows() - self.card_rect.height).div_euclid(2),
+                        rotated.cols(),
+                        rotated.rows(),
+                    );
+
+                    let mut roi = frame.roi_mut(rotated_rect)?;
+                    let card_rotation =
+                        remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                    card_rotation.copy_to(&mut roi)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::Display => {
+                if self.zoom {
+                    self.timer = time_tick.clone();
+                    self.zoom = false;
+                    self.phase = CardDisplayPhase::ZoomIn;
+                    self.tick(time_tick, frame, frame_rect)
+                } else if elapsed_time >= DISPLAY_DURATION {
+                    if self.queue.len() == 0 {
+                        self.timer = time_tick.clone();
+                        self.phase = CardDisplayPhase::Extended;
+                        self.tick(time_tick, frame, frame_rect)
+                    } else {
+                        self.timer = time_tick.clone();
+                        self.phase = CardDisplayPhase::CardFrontRotateOut;
+                        self.tick(time_tick, frame, frame_rect)
+                    }
+                } else {
+                    let display_card = self.display_card.as_ref().unwrap();
+                    let mut roi = frame.roi_mut(self.card_rect)?;
+
+                    let card = remove_white_corners(&roi, &display_card)?;
+                    card.copy_to(&mut roi)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::CardFrontRotateOut => {
+                if elapsed_time >= ROTATE_TIME {
+                    if self.queue.len() == 0 {
+                        self.timer = time_tick.clone();
+                        self.phase = CardDisplayPhase::CardBackRotateIn;
+                        self.tick(time_tick, frame, frame_rect)
+                    } else {
+                        self.timer = time_tick.clone();
+                        self.phase = CardDisplayPhase::CardFrontRotateIn;
+                        let card = self.queue.pop_front().unwrap();
+                        self.load_card_image(&card)?;
+                        self.tick(time_tick, frame, frame_rect)
+                    }
+                } else {
+                    let t = elapsed_time / FADE_OUT_DURATION;
+                    let display_card = self.display_card.as_ref().unwrap();
+                    let green = UMat::new_size_with_default_def(
+                        display_card.size()?,
+                        display_card.typ(),
+                        Scalar::new(0.0, 255.0, 0.0, 0.0),
+                    )?;
+                    let card = remove_white_corners(&green, &display_card)?;
+                    let rotated = rotate_image(&card, t as f32, true)?;
+                    let rotated_rect = core::Rect::new(
+                        self.card_rect.x,
+                        self.card_rect.y - (rotated.rows() - self.card_rect.height).div_euclid(2),
+                        rotated.cols(),
+                        rotated.rows(),
+                    );
+
+                    let mut roi = frame.roi_mut(rotated_rect)?;
+
+                    let card_rotation =
+                        remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                    let card_rotation = remove_white_corners(&roi, &card_rotation)?;
+
+                    card_rotation.copy_to(&mut roi)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::CardBackRotateIn => {
+                if elapsed_time >= ROTATE_TIME {
+                    self.timer = time_tick.clone();
+                    self.phase = CardDisplayPhase::Sleep;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let t = elapsed_time / ROTATE_TIME;
+                    let green = UMat::new_size_with_default_def(
+                        self.card_back.size()?,
+                        self.card_back.typ(),
+                        Scalar::new(0.0, 255.0, 0.0, 0.0),
+                    )?;
+                    let card = remove_white_corners(&green, &self.card_back)?;
+
+                    let rotated = rotate_image(&card, t as f32, false)?;
+                    let rotated_rect = core::Rect::new(
+                        self.card_rect.x,
+                        self.card_rect.y - (rotated.rows() - self.card_rect.height).div_euclid(2),
+                        rotated.cols(),
+                        rotated.rows(),
+                    );
+
+                    let mut roi = frame.roi_mut(rotated_rect)?;
+                    let card_rotation =
+                        remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                    card_rotation.copy_to(&mut roi)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::ZoomIn => {
+                if elapsed_time >= ZOOM_TIME {
+                    self.timer = time_tick.clone();
+                    self.phase = CardDisplayPhase::ZoomDisplay;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let card = self.display_card.as_ref().unwrap();
+                    let percentage = elapsed_time / ZOOM_TIME;
+                    let scale_percentage = Reparameterization::SCurve.apply(percentage);
+
+                    let goal_location = Point::new(
+                        frame_rect.x + center_offset(self.card_rect.width, frame_rect.width),
+                        frame_rect.y + center_offset(self.card_rect.height, frame_rect.height),
+                    );
+
+                    let relocation = relocate_umat(
+                        &Point::new(self.card_rect.x, self.card_rect.y),
+                        &goal_location,
+                        &card,
+                        frame,
+                        percentage,
+                        MoveFunction::SlowFastSlowCurve,
+                    )?;
+                    let resized = safe_scale(
+                        &relocation,
+                        &frame.size()?,
+                        straight_line(1.0, 1.5, scale_percentage),
+                    )?;
+                    let sized_img = resize_umat(card, &resized.size())?;
+                    let roi = frame.roi(resized)?;
+                    let sized_img = remove_white_corners(&roi, &sized_img)?;
+                    place_umat(&sized_img, frame, resized)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::ZoomDisplay => {
+                if elapsed_time >= ZOOM_DISPLAY {
+                    self.timer = time_tick.clone();
+                    self.phase = CardDisplayPhase::ZoomOut;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let card = self.display_card.as_ref().unwrap();
+                    let scale_percentage = Reparameterization::SCurve.apply(1.0);
+
+                    let goal_location = Point::new(
+                        frame_rect.x + center_offset(self.card_rect.width, frame_rect.width),
+                        frame_rect.y + center_offset(self.card_rect.height, frame_rect.height),
+                    );
+
+                    let relocation = relocate_umat(
+                        &Point::new(self.card_rect.x, self.card_rect.y),
+                        &goal_location,
+                        &card,
+                        frame,
+                        1.0,
+                        MoveFunction::SlowFastSlowCurve,
+                    )?;
+                    let resized = safe_scale(
+                        &relocation,
+                        &frame.size()?,
+                        straight_line(1.0, 1.5, scale_percentage),
+                    )?;
+                    let sized_img = resize_umat(card, &resized.size())?;
+                    let roi = frame.roi(resized)?;
+                    let sized_img = remove_white_corners(&roi, &sized_img)?;
+                    place_umat(&sized_img, frame, resized)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::ZoomOut => {
+                if elapsed_time >= ZOOM_TIME {
+                    self.timer = time_tick.clone();
+                    self.phase = CardDisplayPhase::PostZoom;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let card = self.display_card.as_ref().unwrap();
+                    let percentage = 1.0 - (elapsed_time / ZOOM_TIME);
+                    let scale_percentage = Reparameterization::SCurve.apply(percentage);
+
+                    let goal_location = Point::new(
+                        frame_rect.x + center_offset(self.card_rect.width, frame_rect.width),
+                        frame_rect.y + center_offset(self.card_rect.height, frame_rect.height),
+                    );
+
+                    let relocation = relocate_umat(
+                        &Point::new(self.card_rect.x, self.card_rect.y),
+                        &goal_location,
+                        &card,
+                        frame,
+                        percentage,
+                        MoveFunction::SlowFastSlowCurve,
+                    )?;
+                    let resized = safe_scale(
+                        &relocation,
+                        &frame.size()?,
+                        straight_line(1.0, 1.5, scale_percentage),
+                    )?;
+                    let sized_img = resize_umat(card, &resized.size())?;
+                    let roi = frame.roi(resized)?;
+                    let sized_img = remove_white_corners(&roi, &sized_img)?;
+                    place_umat(&sized_img, frame, resized)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::PostZoom => {
+                if elapsed_time >= POST_ZOOM_TIME {
+                    self.timer = time_tick.clone();
+                    self.phase = CardDisplayPhase::CardFrontRotateOut;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let display_card = self.display_card.as_ref().unwrap();
+                    let mut roi = frame.roi_mut(self.card_rect)?;
+
+                    let card = remove_white_corners(&roi, &display_card)?;
+                    card.copy_to(&mut roi)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::Extended => {
+                if elapsed_time >= EXTENDED_DISPLAY_DURATION || self.queue.len() > 0 {
+                    self.timer = time_tick.clone();
+                    self.phase = CardDisplayPhase::CardFrontRotateOut;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let display_card = self.display_card.as_ref().unwrap();
+                    let mut roi = frame.roi_mut(self.card_rect)?;
+
+                    let card = remove_white_corners(&roi, &display_card)?;
+                    card.copy_to(&mut roi)?;
+                    Ok(())
+                }
+            }
+            CardDisplayPhase::Sleep => {
+                if self.queue.len() > 0 {
+                    self.timer = time_tick.clone();
+                    let card = self.queue.pop_front().unwrap();
+                    self.load_card_image(&card)?;
+
+                    self.phase = CardDisplayPhase::CardBackRotateOut;
+                    self.tick(time_tick, frame, frame_rect)
+                } else {
+                    let roi = frame.roi(self.card_rect)?;
+                    let card = remove_color(&roi, &self.card_back, &GREEN)?;
+                    place_umat(&card, frame, self.card_rect)?;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn load_card_image(&mut self, display_card: &DataRow) -> Result<()> {
+        let mut img = self
+            .card_db
+            .load_card_image(&display_card.name, &display_card.pitch);
+        if img.cols() > img.rows() {
+            let mut rotated_card_image = UMat::new_def();
+            opencv::core::rotate(
+                &img,
+                &mut rotated_card_image,
+                opencv::core::ROTATE_90_CLOCKWISE,
+            )?;
+            img = rotated_card_image
+        }
+        opencv::imgproc::resize(
+            &img.clone(),
+            &mut img,
+            self.card_rect.size(),
+            0.0,
+            0.0,
+            opencv::imgproc::INTER_LINEAR,
+        )?;
+        self.display_card.replace(img);
+        Ok(())
+    }
+}
 
 // Change the alias to use `Box<dyn error::Error>`.
 type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 struct DataRow {
     sec: u64,
     milli: f64,
@@ -183,15 +591,6 @@ impl PartialOrd for TimeTick {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum FadeStage {
-    PRE,
-    IN,
-    DISPLAY,
-    OUT,
-    POST,
-}
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum TurnPlayer {
     None,
@@ -213,58 +612,8 @@ impl TurnPlayer {
     }
 }
 
-struct VideoCapLooper {
-    fp: String,
-    cap: VideoCapture,
-}
-
-impl VideoCapLooper {
-    fn build(video_fp: &str) -> Result<Self> {
-        let cap = VideoCapture::from_file_def(video_fp)?;
-        Ok(Self {
-            fp: video_fp.to_owned(),
-            cap,
-        })
-    }
-
-    fn read(&mut self) -> Result<UMat> {
-        let mut frame = UMat::new_def();
-        let got = self.cap.read(&mut frame)?;
-        if !got {
-            self.cap = VideoCapture::from_file_def(&self.fp)?;
-            self.cap.read(&mut frame)?;
-        }
-
-        // HACK
-        let mut inverted_frame = UMat::new_def();
-        bitwise_not_def(&frame, &mut inverted_frame)?;
-        cvt_color_def(&inverted_frame, &mut frame, COLOR_BGR2GRAY)?;
-        // cvt_color_def(&frame, &mut inverted_frame, COLOR_RGB2BGR)?;
-        cvt_color_def(&frame, &mut inverted_frame, COLOR_GRAY2RGB)?;
-
-        Ok(inverted_frame)
-    }
-}
-
-/// Loads image to UMat
-fn load_image(fp: &str) -> Result<UMat> {
-    let mut umat = UMat::new_def();
-    let img = imgcodecs::imread(fp, imgcodecs::IMREAD_COLOR)?;
-    img.copy_to(&mut umat)?;
-
-    Ok(umat)
-}
-
 fn main() -> Result<()> {
     let args = Cli::parse();
-
-    // Load card back
-    let mut card_back_img = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-    let _card_back = imgcodecs::imread(&CARD_BACK_FP, imgcodecs::IMREAD_COLOR).unwrap();
-    _card_back.copy_to(&mut card_back_img)?;
-
-    // Load card db
-    let card_image_db = lib::card::CardImageDB::init();
 
     // Load game stats
     let mut rows: VecDeque<std::result::Result<DataRow, csv::Error>> = csv::ReaderBuilder::new()
@@ -273,6 +622,17 @@ fn main() -> Result<()> {
         .expect("Could not load card file")
         .deserialize()
         .collect();
+
+    let player1_row = rows
+        .pop_front()
+        .expect("Invalid card file")
+        .expect("Invalid row format");
+    let player2_row = rows
+        .pop_front()
+        .expect("Invalid card file")
+        .expect("Invalid row format");
+    let player1 = player1_row.name;
+    let player2 = player2_row.name;
 
     let first_stats = rows
         .pop_front()
@@ -314,153 +674,164 @@ fn main() -> Result<()> {
 
     // Create capture
     let mut cap = VideoCapture::from_file(&args.video_file, videoio::CAP_ANY)?;
-    let original_width = cap.get(videoio::CAP_PROP_FRAME_WIDTH)?;
-    let original_height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)?;
     let fps = cap.get(videoio::CAP_PROP_FPS)?;
 
     // Create background capture
     let mut background_loop = VideoCapLooper::build(&BACKGROUND_ANIM_FILE)?;
 
-    let font_scale = { original_width / 1920.0 };
-
-    // Calculate Rotated Dimensions
-    let rotate = original_width < original_height;
-    let rotated_width = original_height;
-    let rotated_height = original_width;
-
-    // Set Frame Dimensions
-    let frame_height = if rotate {
-        rotated_height
-    } else {
-        original_height
-    };
-    let frame_width = if rotate {
-        rotated_width
-    } else {
-        original_width
-    };
-
-    let frame_size = Size::new(frame_width as i32, frame_height as i32);
-
-    // Scoreboard dimensions
-    let scoreboard_width = (frame_width * SCOREBOARD_WIDTH_RATIO) as i32;
+    let frame_size = Size::new(FRAME_WIDTH, FRAME_HEIGHT);
 
     // Relative dimensions
-    let innerframe_rel_roi = RelativeRoi::build_as_partition(
-        SCOREBOARD_WIDTH_RATIO,
+
+    // Top panel
+    let hero1_rel_roi = RelativeRoi::build(
+        SIDE_PANEL_WIDTH_RATIO,
         0.0,
-        1.0 - SCOREBOARD_WIDTH_RATIO,
-        1.0,
-        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
-        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
-        Some(HorizontalPartition::Right),
-        None,
-    )?;
-    let turn_counter_rel_roi = RelativeRoi::build(
-        1.0 - 1.0 / 10.0,
-        0.,
-        1.0 / 10.0,
-        1.0 / 10.0,
-        Some(SCOREBOARD_WIDTH_BUFFER_RATIO + 1.0 / 300.0),
-        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO + 1.0 / 200.0),
-    )?;
-    let card_rel_roi = RelativeRoi::build_as_partition(
+        (1.0 / 3.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        TOP_PANEL_HEIGHT_RATIO,
+        WIDTH_BUFFER_RATIO,
         0.0,
-        0.5,
-        SCOREBOARD_WIDTH_RATIO,
-        0.5,
-        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
-        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
-        Some(HorizontalPartition::Left),
-        Some(VerticalPartition::Bottom),
+        HEIGHT_BUFFER_RATIO,
+        0.0,
     )?;
+    let hero2_rel_roi = RelativeRoi::build(
+        SIDE_PANEL_WIDTH_RATIO + (2.0 / 3.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        0.0,
+        (1.0 / 3.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        TOP_PANEL_HEIGHT_RATIO,
+        0.0,
+        WIDTH_BUFFER_RATIO,
+        HEIGHT_BUFFER_RATIO,
+        0.0,
+    )?;
+    let player1_rel_roi = RelativeRoi::build(
+        SIDE_PANEL_WIDTH_RATIO,
+        TOP_PANEL_HEIGHT_RATIO,
+        (1.0 / 3.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        TOP_PANEL_HEIGHT_RATIO / 4.0,
+        WIDTH_BUFFER_RATIO,
+        0.0,
+        0.0,
+        0.0,
+    )?;
+    let player2_rel_roi = RelativeRoi::build(
+        SIDE_PANEL_WIDTH_RATIO + (2.0 / 3.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        TOP_PANEL_HEIGHT_RATIO,
+        (1.0 / 3.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        TOP_PANEL_HEIGHT_RATIO / 4.0,
+        0.0,
+        WIDTH_BUFFER_RATIO,
+        0.0,
+        0.0,
+    )?;
+    let life1_rel_roi = RelativeRoi::build(
+        SIDE_PANEL_WIDTH_RATIO + (1.0 / 3.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        0.0,
+        (1.0 / 6.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        TOP_PANEL_HEIGHT_RATIO,
+        0.0,
+        WIDTH_BUFFER_RATIO,
+        HEIGHT_BUFFER_RATIO,
+        0.0,
+    )?;
+    let life2_rel_roi = RelativeRoi::build(
+        SIDE_PANEL_WIDTH_RATIO + 0.5 * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        0.0,
+        (1.0 / 6.0) * (1.0 - SIDE_PANEL_WIDTH_RATIO),
+        TOP_PANEL_HEIGHT_RATIO,
+        WIDTH_BUFFER_RATIO,
+        0.0,
+        HEIGHT_BUFFER_RATIO,
+        0.0,
+    )?;
+    let life_symbol_rel_roi = RelativeRoi::build(
+        SIDE_PANEL_WIDTH_RATIO + (1.0 - SIDE_PANEL_WIDTH_RATIO) * 0.5
+            - LIFE_SYMBOL_WIDTH_RATIO / 2.0,
+        0.0,
+        LIFE_SYMBOL_WIDTH_RATIO,
+        TOP_PANEL_HEIGHT_RATIO,
+        0.0,
+        0.0,
+        HEIGHT_BUFFER_RATIO,
+        0.0,
+    )?;
+
+    // Inner frame
+    let innerframe_rel_roi = RelativeRoi::build(
+        SIDE_PANEL_WIDTH_RATIO,
+        TOP_PANEL_HEIGHT_RATIO,
+        1.0 - SIDE_PANEL_WIDTH_RATIO,
+        1.0 - TOP_PANEL_HEIGHT_RATIO,
+        WIDTH_BUFFER_RATIO / 2.0,
+        WIDTH_BUFFER_RATIO,
+        HEIGHT_BUFFER_RATIO,
+        HEIGHT_BUFFER_RATIO,
+    )?;
+
+    // Side panel
     let logo_rel_roi = RelativeRoi::build_as_partition(
         0.0,
         0.0,
         SCOREBOARD_WIDTH_RATIO,
-        3.0 / 12.0,
-        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
-        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        0.5,
+        Some(WIDTH_BUFFER_RATIO),
+        Some(HEIGHT_BUFFER_RATIO),
         Some(HorizontalPartition::Left),
         Some(VerticalPartition::Top),
     )?;
-    let hero1_rel_roi = RelativeRoi::build_as_partition(
-        0.,
-        4.0 / 12.0,
-        SCOREBOARD_WIDTH_RATIO / 2.0,
-        2.0 / 12.0,
-        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
-        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
-        Some(HorizontalPartition::Left),
-        Some(VerticalPartition::Center),
-    )?;
-    let hero2_rel_roi = RelativeRoi::build_as_partition(
-        SCOREBOARD_WIDTH_RATIO / 2.0,
-        4.0 / 12.0,
-        SCOREBOARD_WIDTH_RATIO / 2.0,
-        2.0 / 12.0,
-        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
-        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
-        Some(HorizontalPartition::Center),
-        Some(VerticalPartition::Center),
-    )?;
-    let left_text_rel_roi = RelativeRoi::build_as_partition(
+    let card_rel_roi = RelativeRoi::build_as_partition(
         0.0,
-        3.0 / 12.0,
-        SCOREBOARD_WIDTH_RATIO / 2.0,
-        1.0 / 12.0,
-        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
-        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
+        0.5,
+        SIDE_PANEL_WIDTH_RATIO,
+        0.5,
+        Some(WIDTH_BUFFER_RATIO),
+        Some(HEIGHT_BUFFER_RATIO),
         Some(HorizontalPartition::Left),
-        Some(VerticalPartition::Center),
-    )?;
-    let right_text_rel_roi = RelativeRoi::build_as_partition(
-        SCOREBOARD_WIDTH_RATIO / 2.0,
-        3.0 / 12.0,
-        SCOREBOARD_WIDTH_RATIO / 2.0,
-        1.0 / 12.0,
-        Some(SCOREBOARD_WIDTH_BUFFER_RATIO),
-        Some(SCOREBOARD_HEIGHT_BUFFER_RATIO),
-        Some(HorizontalPartition::Center),
-        Some(VerticalPartition::Center),
+        Some(VerticalPartition::Bottom),
     )?;
 
     // Get hero images
-    let hero1_image = card_image_db.load_card_image(&hero1_stats.name, &None);
-    let hero2_image = card_image_db.load_card_image(&hero2_stats.name, &None);
+    let full_art_manager = FullArtHeroManager::new();
+    let hero1_animation_fp = full_art_manager.get_hero_art_animation_fp(&hero1_stats.name)?;
+    let hero2_animation_fp = full_art_manager.get_hero_art_animation_fp(&hero2_stats.name)?;
 
-    let hero_width = ((scoreboard_width as f64) * 0.5) as i32;
-    let hero_length = (CARD_HEIGHT_RATIO * (hero_width as f64)) as i32;
-    let hero1_image =
-        get_card_art(&hero1_image, hero_width, hero_length).expect("Could not load hero1 image");
-    let hero2_image =
-        get_card_art(&hero2_image, hero_width, hero_length).expect("Could not load hero2 image");
+    let mut hero1_animation = VideoCapLooper::build(&hero1_animation_fp)?;
+    let mut hero2_animation = VideoCapLooper::build(&hero2_animation_fp)?;
 
-    // Card dimensions
-    let card_rect = card_rel_roi.generate_roi_raw(&frame_size);
-
-    // Adjust cardback and prevent further mutations
-    opencv::imgproc::resize(
-        &card_back_img.clone(),
-        &mut card_back_img,
-        // Size::new(card_width, card_height),
-        Size::new(card_rect.width, card_rect.height),
-        0.0,
-        0.0,
-        opencv::imgproc::INTER_LINEAR,
-    )?;
-    let card_back_img = card_back_img;
+    // Load card back
+    let card_back_img = load_image(&CARD_BACK_FP)?;
+    let green_background =
+        UMat::new_size_with_default_def(card_back_img.size()?, card_back_img.typ(), GREEN)?;
+    let card_back_img = remove_white_corners(&green_background, &card_back_img)?;
+    let card_back_img = card_rel_roi.resize(&frame_size, &card_back_img)?;
+    let card_rect = card_rel_roi.generate_roi(&frame_size, &card_back_img);
 
     let increment = fps.recip() * MILLI;
 
     // Generate output video
     let mut out = VideoWriter::new(
         &tmp_path,
+        // VideoWriter::fourcc('h', '2', '6', '4').unwrap(),
+        // VideoWriter::fourcc('a', 'v', 'c', '1').unwrap(),
         VideoWriter::fourcc('m', 'p', '4', 'v').unwrap(),
         fps,
-        Size::new(frame_width as i32, frame_height as i32),
+        frame_size,
         true,
     )?;
+
+    // Create intro
+    println!("Generating intro...");
+    generate_intro(
+        &hero1_animation_fp,
+        &player1,
+        &hero2_animation_fp,
+        &player2,
+        &frame_size,
+        card_back_img.typ(),
+        fps,
+        &mut out,
+    )?;
+    println!("Intro generated!");
 
     // Load GoToOne Logo
     let logo_image = load_image(&LOGO_FP)?;
@@ -470,7 +841,7 @@ fn main() -> Result<()> {
         &mut logo_image,
         core::Rect::new(0, 0, logo_roi.width, logo_roi.height),
         Scalar::new(0., 0., 0., 0.),
-        (HERO_BORDER_THICKNESS as f64 * 2.0 * font_scale) as i32,
+        (HERO_BORDER_THICKNESS as f64 * 2.0) as i32,
         imgproc::LINE_8,
         0,
     )?;
@@ -479,12 +850,7 @@ fn main() -> Result<()> {
     let logo_image = logo_image;
 
     // Set init vars
-    let mut display_start_time = None;
-    let mut fade_start_time: Option<TimeTick> = None;
-    let mut post_fade_start_time: Option<TimeTick> = None;
     let mut time_tick = TimeTick::new();
-    let mut display_card: VecDeque<DataRow> = VecDeque::new();
-    let mut card_image = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
     let mut winner: Option<u8> = None;
 
     // Track what the players lives should be so we can tick them down
@@ -494,7 +860,6 @@ fn main() -> Result<()> {
         LifeTracker::build(&hero2_stats.player2_life.unwrap(), LIFE_TICK, increment);
 
     let mut turn_counter = 0_u32;
-    let mut card_back = true;
 
     // start progress bar
     let bar = {
@@ -505,7 +870,17 @@ fn main() -> Result<()> {
         }
     };
 
+    let mut card_display_manager = CardDisplayManager::new(&card_rect, &card_back_img, &time_tick);
+
+    // Cut beginning of video where intro would be
+    for _ in 0..(INTRO_TIME * fps) as i32 {
+        let mut frame = UMat::new_def();
+        cap.read(&mut frame)?;
+        time_tick.increment_milli(increment);
+    }
+
     // LOOP HERE
+    println!("overlaying video...");
     loop {
         // Check timeout
         if let Some(sec) = args.timeout {
@@ -514,7 +889,7 @@ fn main() -> Result<()> {
             }
         }
 
-        let mut frame = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
+        let mut frame = UMat::new_def();
         time_tick.increment_milli(increment);
 
         // Increment life ticker
@@ -527,29 +902,33 @@ fn main() -> Result<()> {
         }
 
         // Draw background
-        let background_frame = background_loop.read()?;
+        let background_frame = background_loop.background_read()?;
 
         let mut background = UMat::new_def();
         opencv::imgproc::resize(
             &background_frame,
             &mut background,
-            Size::new(frame_width as i32, frame_height as i32),
+            frame_size,
             0.0,
             0.0,
             opencv::imgproc::INTER_AREA,
         )?;
 
         // Crop frame
-        let crop_left = ((args.crop_left.unwrap_or(0.0) / 100.0) * frame_width) as i32;
-        let crop_right = ((args.crop_right.unwrap_or(0.0) / 100.0) * frame_width) as i32;
-        let crop_top = ((args.crop_top.unwrap_or(0.0) / 100.0) * frame_height) as i32;
-        let crop_bottom = ((args.crop_bottom.unwrap_or(0.0) / 100.0) * frame_height) as i32;
+        let crop_left =
+            ((args.crop_left.unwrap_or(0.0) / 100.0) * frame.size()?.width as f64) as i32;
+        let crop_right =
+            ((args.crop_right.unwrap_or(0.0) / 100.0) * frame.size()?.width as f64) as i32;
+        let crop_top =
+            ((args.crop_top.unwrap_or(0.0) / 100.0) * frame.size()?.height as f64) as i32;
+        let crop_bottom =
+            ((args.crop_bottom.unwrap_or(0.0) / 100.0) * frame.size()?.height as f64) as i32;
 
         let crop_roi = frame.roi(core::Rect::new(
             crop_left,
             crop_top,
-            frame_width as i32 - (crop_left + crop_right),
-            ((frame_height - (crop_top + crop_bottom) as f64) * FRAME_HEIGHT_RATIO) as i32,
+            frame.size()?.width - (crop_left + crop_right),
+            ((frame.size()?.height - (crop_top + crop_bottom)) as f64 * FRAME_HEIGHT_RATIO) as i32,
         ))?;
         let mut innerframe = UMat::new_def();
         crop_roi.copy_to(&mut innerframe)?;
@@ -557,7 +936,6 @@ fn main() -> Result<()> {
         let reframe = innerframe_rel_roi.resize(&frame_size, &innerframe)?;
         let frame_roi_rect = innerframe_rel_roi.generate_roi(&frame_size, &innerframe);
         let mut frame_roi = background.roi_mut(frame_roi_rect)?;
-        // let mut frame_roi = background.roi_mut(frame_rect)?;
         reframe.copy_to(frame_roi.borrow_mut())?;
         imgproc::rectangle(
             &mut background,
@@ -572,6 +950,9 @@ fn main() -> Result<()> {
         frame = background;
 
         // Heroes
+        let hero1_image = hero1_animation.read()?;
+        let mut hero1_image = FullArtHeroManager::crop_hero_img(&hero1_image)?;
+        flip(&hero1_image.clone(), &mut hero1_image, 1)?;
         let hero1_rect = hero1_rel_roi.generate_roi(&frame_size, &hero1_image);
         let hero1_image = hero1_rel_roi.resize(&frame_size, &hero1_image)?;
 
@@ -590,11 +971,13 @@ fn main() -> Result<()> {
             &mut frame,
             hero1_rect,
             hero1_color,
-            HERO_BORDER_THICKNESS * font_scale as i32,
+            HERO_BORDER_THICKNESS,
             imgproc::LINE_8,
             0,
         )?;
 
+        let hero2_image = hero2_animation.read()?;
+        let hero2_image = FullArtHeroManager::crop_hero_img(&hero2_image)?;
         let hero2_rect = hero2_rel_roi.generate_roi(&frame_size, &hero2_image);
         let hero2_image = hero2_rel_roi.resize(&frame_size, &hero2_image)?;
 
@@ -614,13 +997,13 @@ fn main() -> Result<()> {
             &mut frame,
             hero2_rect,
             hero2_color,
-            HERO_BORDER_THICKNESS * font_scale as i32,
+            HERO_BORDER_THICKNESS,
             imgproc::LINE_8,
             0,
         )?;
 
-        let left_rect = left_text_rel_roi.generate_roi_raw(&frame_size);
-        let right_rect = right_text_rel_roi.generate_roi_raw(&frame_size);
+        let left_rect = life1_rel_roi.generate_roi_raw(&frame_size);
+        let right_rect = life2_rel_roi.generate_roi_raw(&frame_size);
 
         let mut overlay = frame.clone();
         imgproc::rectangle(
@@ -644,63 +1027,91 @@ fn main() -> Result<()> {
         )?;
         core::add_weighted(&overlay, 0.5, &frame.clone(), 0.5, 0., &mut frame, -1)?;
 
-        center_text_at(
+        center_text_at_rel(
             &mut frame,
             &player1_life_tracker.display(),
             SCORE_FONT_STYLE,
             SCORE_FONT_SCALE,
             Scalar::new(255.0, 255.0, 255.0, 0.0),
             SCORE_FONT_WIDTH,
-            left_text_rel_roi,
+            life1_rel_roi,
             20,
         )?;
-        center_text_at(
+        center_text_at_rel(
             &mut frame,
             &player2_life_tracker.display(),
             SCORE_FONT_STYLE,
             SCORE_FONT_SCALE,
             Scalar::new(255.0, 255.0, 255.0, 0.0),
             SCORE_FONT_WIDTH,
-            right_text_rel_roi,
+            life2_rel_roi,
+            20,
+        )?;
+        center_text_at_rel(
+            &mut frame,
+            &player1,
+            TURN_FONT_FACE,
+            TURN_FONT_SCALE,
+            WHITE,
+            TURN_FONT_THICKNESS,
+            player1_rel_roi,
+            20,
+        )?;
+        center_text_at_rel(
+            &mut frame,
+            &player2,
+            TURN_FONT_FACE,
+            TURN_FONT_SCALE,
+            WHITE,
+            TURN_FONT_THICKNESS,
+            player2_rel_roi,
             20,
         )?;
 
+        // Life
+        let life_img = load_image_unchanged(LIFE_FP)?;
+        let mut life_img = convert_alpha_to_white(&life_img)?;
+        cvt_color_def(&life_img.clone(), &mut life_img, COLOR_RGBA2RGB)?;
+
+        let life_rect = life_symbol_rel_roi.generate_roi(&frame_size, &life_img);
+        let life_img = life_symbol_rel_roi.resize(&frame_size, &life_img)?;
+
+        let roi = frame.roi(life_rect)?;
+        let new = remove_color(&roi, &life_img, &Scalar::new(255.0, 255.0, 255.0, 0.0))?;
+
+        let mut roi = frame.roi_mut(life_rect)?;
+        new.copy_to(roi.borrow_mut())?;
+
         // Turn counter
         if turn_counter > 0 {
+            let turn_counter_rect = Rect::new(
+                frame_roi_rect.x + 7 * frame_roi_rect.width.div_euclid(8),
+                frame_roi_rect.y,
+                frame_roi_rect.width.div_euclid(8),
+                frame_roi_rect.height.div_euclid(16),
+            );
             imgproc::rectangle(
                 &mut frame,
-                turn_counter_rel_roi.generate_roi_raw(&frame_size),
+                turn_counter_rect,
                 Scalar::new(0., 0., 0., 0.),
                 -1,
                 imgproc::LINE_8,
                 0,
             )?;
-            center_text_at(
+            center_text_at_rect(
                 &mut frame,
                 &format!("Turn {}", turn_counter),
                 TURN_FONT_FACE,
                 TURN_FONT_SCALE,
                 Scalar::new(255.0, 255.0, 255.0, 0.0),
                 TURN_FONT_THICKNESS,
-                turn_counter_rel_roi,
+                turn_counter_rect,
                 20,
             )?;
         }
 
         let mut logo_roi = frame.roi_mut(logo_roi)?;
         logo_image.copy_to(logo_roi.borrow_mut())?;
-
-        // Rotate frame if necessary
-        // Not currently working
-        if rotate {
-            let mut rotated_frame = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-            opencv::core::rotate(
-                &frame,
-                &mut rotated_frame,
-                opencv::core::ROTATE_90_CLOCKWISE,
-            )?;
-            frame = rotated_frame;
-        }
 
         // Parse Row Data
         if let Some(row) = rows.front() {
@@ -710,7 +1121,9 @@ fn main() -> Result<()> {
             if time <= time_tick {
                 let row = rows.pop_front().unwrap().unwrap();
                 if row.update_type.trim() == CARD_DATA_TYPE {
-                    display_card.push_back(row);
+                    card_display_manager.add_card_to_queue(row);
+                } else if row.update_type == ZOOM {
+                    card_display_manager.queue_zoom();
                 } else if row.update_type == TURN_DATA_TYPE {
                     turn_counter += 1;
                     turn_player.swap_update(&first_turn_player);
@@ -731,234 +1144,7 @@ fn main() -> Result<()> {
             }
         }
 
-        // Add start time and card image
-        if let (Some(card), None) = (display_card.front(), display_start_time) {
-            display_start_time = Some(time_tick.clone());
-            card_image = card_image_db.load_card_image(&card.name, &card.pitch);
-        }
-
-        // Display card (rotate)
-        if let (Some(_), Some(start_time)) = (&display_card.front(), &display_start_time) {
-            let elapsed_time = (time_tick - *start_time).as_f64();
-            // card has not faded out yet
-            if fade_start_time.is_none_or(|v| (time_tick - v).as_f64() < FADE_OUT_DURATION)
-                // Start flip to back
-                || (fade_start_time.is_some()
-                    && post_fade_start_time.is_none()
-                    && display_card.len() == 1)
-                // Flip to back in progress
-                || post_fade_start_time
-                    .is_some_and(|v| (time_tick - v).as_f64() < FADE_OUT_DURATION)
-            {
-                let fade_stage = {
-                    // Fade out card back
-                    if elapsed_time < FADE_IN_DURATION && card_back {
-                        FadeStage::PRE
-                    // Fade in
-                    } else if elapsed_time < FADE_IN_DURATION
-                        || (elapsed_time < 2.0 * FADE_IN_DURATION && card_back)
-                    {
-                        FadeStage::IN
-                    // Minimum Display time
-                    } else if elapsed_time < DISPLAY_DURATION - FADE_OUT_DURATION {
-                        FadeStage::DISPLAY
-                    // Extended display
-                    } else if elapsed_time < EXTENDED_DISPLAY_DURATION - 2.0 * FADE_OUT_DURATION
-                        && display_card.len() == 1
-                    {
-                        FadeStage::DISPLAY
-                    // Fade out
-                    } else if elapsed_time < EXTENDED_DISPLAY_DURATION - FADE_OUT_DURATION {
-                        FadeStage::OUT
-                    } else {
-                        FadeStage::POST
-                    }
-                };
-
-                // Start fade out timer if not started yet
-                if fade_stage == FadeStage::OUT && fade_start_time.is_none() {
-                    card_back = false;
-                    let _ = fade_start_time.insert(time_tick.clone());
-                }
-
-                // Start post fade out timer if not started yet
-                if fade_stage == FadeStage::POST && post_fade_start_time.is_none() {
-                    card_back = true;
-                    let _ = post_fade_start_time.insert(time_tick.clone());
-                }
-
-                if card_image.cols() > card_image.rows() {
-                    let mut rotated_card_image = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-                    opencv::core::rotate(
-                        &card_image,
-                        &mut rotated_card_image,
-                        opencv::core::ROTATE_90_CLOCKWISE,
-                    )?;
-                    card_image = rotated_card_image;
-                }
-
-                opencv::imgproc::resize(
-                    &card_image.clone(),
-                    &mut card_image,
-                    // Size::new(card_width, card_height),
-                    card_rect.size(),
-                    0.0,
-                    0.0,
-                    opencv::imgproc::INTER_LINEAR,
-                )?;
-
-                match fade_stage {
-                    FadeStage::PRE => {
-                        let alpha = elapsed_time / FADE_IN_DURATION;
-                        let green = UMat::new_rows_cols_with_default(
-                            card_back_img.rows(),
-                            card_back_img.cols(),
-                            card_back_img.typ(),
-                            Scalar::new(0.0, 255.0, 0.0, 0.0),
-                            core::UMatUsageFlags::USAGE_DEFAULT,
-                        )?;
-                        let card = remove_white_corners(&green, &card_back_img)?;
-
-                        let rotated = rotate_image(&card, alpha as f32, true)?;
-                        let rotated_rect = core::Rect::new(
-                            card_rect.x,
-                            card_rect.y - (rotated.rows() - card_rect.height).div_euclid(2),
-                            rotated.cols(),
-                            rotated.rows(),
-                        );
-
-                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-                        let _roi = &frame.roi(rotated_rect)?;
-                        _roi.copy_to(&mut roi)?;
-
-                        let card_rotation =
-                            remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
-                        let mut inner_roi = frame.roi_mut(rotated_rect)?;
-                        card_rotation.copy_to(&mut inner_roi)?;
-                    }
-                    FadeStage::IN => {
-                        let adjusted_lapsed_time = {
-                            if card_back {
-                                elapsed_time - FADE_IN_DURATION
-                            } else {
-                                elapsed_time
-                            }
-                        };
-
-                        let alpha = adjusted_lapsed_time / FADE_IN_DURATION;
-                        let green = UMat::new_rows_cols_with_default(
-                            card_image.rows(),
-                            card_image.cols(),
-                            card_image.typ(),
-                            Scalar::new(0.0, 255.0, 0.0, 0.0),
-                            core::UMatUsageFlags::USAGE_DEFAULT,
-                        )?;
-                        let card = remove_white_corners(&green, &card_image)?;
-
-                        let rotated = rotate_image(&card, alpha as f32, false)?;
-                        let rotated_rect = core::Rect::new(
-                            card_rect.x,
-                            card_rect.y - (rotated.rows() - card_rect.height).div_euclid(2),
-                            rotated.cols(),
-                            rotated.rows(),
-                        );
-
-                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-                        let _roi = &frame.roi(rotated_rect)?;
-                        _roi.copy_to(&mut roi)?;
-
-                        let card_rotation =
-                            remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
-                        let mut inner_roi = frame.roi_mut(rotated_rect)?;
-                        card_rotation.copy_to(&mut inner_roi)?;
-                    }
-                    FadeStage::DISPLAY => {
-                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-                        let mut inner_roi = frame.roi_mut(card_rect)?;
-
-                        inner_roi.copy_to(&mut roi)?;
-
-                        let card_rotation = remove_white_corners(&roi, &card_image)?;
-                        card_rotation.copy_to(&mut inner_roi)?;
-                    }
-                    FadeStage::OUT => {
-                        let alpha =
-                            (time_tick - fade_start_time.unwrap()).as_f64() / FADE_OUT_DURATION;
-                        let green = UMat::new_rows_cols_with_default(
-                            card_image.rows(),
-                            card_image.cols(),
-                            card_image.typ(),
-                            Scalar::new(0.0, 255.0, 0.0, 0.0),
-                            core::UMatUsageFlags::USAGE_DEFAULT,
-                        )?;
-                        let card = remove_white_corners(&green, &card_image)?;
-                        let rotated = rotate_image(&card, alpha as f32, true)?;
-                        let rotated_rect = core::Rect::new(
-                            card_rect.x,
-                            card_rect.y - (rotated.rows() - card_rect.height).div_euclid(2),
-                            rotated.cols(),
-                            rotated.rows(),
-                        );
-
-                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-                        let _roi = &frame.roi(rotated_rect)?;
-                        _roi.copy_to(&mut roi)?;
-
-                        let card_rotation =
-                            remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
-                        let card_rotation = remove_white_corners(&roi, &card_rotation)?;
-
-                        let mut inner_roi = frame.roi_mut(rotated_rect)?;
-                        card_rotation.copy_to(&mut inner_roi)?;
-                    }
-                    FadeStage::POST => {
-                        let alpha = (time_tick - post_fade_start_time.unwrap()).as_f64()
-                            / FADE_OUT_DURATION;
-                        let green = UMat::new_rows_cols_with_default(
-                            card_image.rows(),
-                            card_image.cols(),
-                            card_image.typ(),
-                            Scalar::new(0.0, 255.0, 0.0, 0.0),
-                            core::UMatUsageFlags::USAGE_DEFAULT,
-                        )?;
-                        let card = remove_white_corners(&green, &card_back_img)?;
-                        let rotated = rotate_image(&card, alpha as f32, false)?;
-                        let rotated_rect = core::Rect::new(
-                            card_rect.x,
-                            card_rect.y - (rotated.rows() - card_rect.height).div_euclid(2),
-                            rotated.cols(),
-                            rotated.rows(),
-                        );
-
-                        let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-                        let _roi = &frame.roi(rotated_rect)?;
-                        _roi.copy_to(&mut roi)?;
-
-                        let card_rotation =
-                            remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
-                        let card_rotation = remove_white_corners(&roi, &card_rotation)?;
-
-                        let mut inner_roi = frame.roi_mut(rotated_rect)?;
-                        card_rotation.copy_to(&mut inner_roi)?;
-                    }
-                }
-            } else {
-                display_card.pop_front();
-                display_start_time = None;
-                fade_start_time = None;
-                post_fade_start_time = None;
-            }
-        }
-
-        if display_card.len() == 0 {
-            let mut roi = UMat::new(core::UMatUsageFlags::USAGE_DEFAULT);
-            let mut inner_roi = frame.roi_mut(card_rect)?;
-
-            inner_roi.copy_to(&mut roi)?;
-
-            let card_rotation = remove_white_corners(&roi, &card_back_img)?;
-            card_rotation.copy_to(&mut inner_roi)?;
-        }
+        card_display_manager.tick(time_tick, &mut frame, &frame_roi_rect)?;
 
         out.write(&frame)?;
         if args.timeout.is_some() {

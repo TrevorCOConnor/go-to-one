@@ -4,6 +4,7 @@ use std::error;
 pub enum RoiError {
     TooWide,
     TooTall,
+    NegativeScale,
 }
 
 impl error::Error for RoiError {}
@@ -16,6 +17,9 @@ impl std::fmt::Display for RoiError {
             }
             RoiError::TooTall => {
                 write!(f, "Region is too tall for the frame")
+            }
+            RoiError::NegativeScale => {
+                write!(f, "Cannot scale a region by a negative number")
             }
         }
     }

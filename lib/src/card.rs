@@ -1,8 +1,8 @@
 use csv::StringRecord;
 use log::warn;
 use opencv::{
-    core::{MatTraitConst, UMat, UMatTraitConst, Vector, CV_8U},
-    imgcodecs::{imdecode, IMREAD_UNCHANGED},
+    core::{MatTraitConst, UMat, UMatTraitConst, Vector, CV_16U, CV_8U, CV_8UC3},
+    imgcodecs::{imdecode, IMREAD_COLOR, IMREAD_UNCHANGED},
     imgproc::{cvt_color_def, COLOR_RGBA2RGB},
 };
 
@@ -114,9 +114,9 @@ pub struct CardImageDB {
 }
 
 impl CardImageDB {
-    pub fn init() -> Self {
+    pub fn build(fp: &str) -> Self {
         let mut map: HashMap<(String, Option<u32>), String> = HashMap::new();
-        let file = File::open(URL_FILE).expect(&format!("Could not find {}", URL_FILE));
+        let file = File::open(fp).expect(&format!("Could not find {}", URL_FILE));
 
         let mut reader = csv::ReaderBuilder::new().delimiter(b'\t').from_reader(file);
         let headers = reader.headers().expect("Headers not found").to_owned();
@@ -129,7 +129,7 @@ impl CardImageDB {
             let set = row[headers["Set ID"]].to_string();
             let pitch = row[headers["Card Pitch"]].parse::<u32>().ok();
             // Skip HP1 and promo cards
-            if ["HP1", "FAB", "HER", "WIN"].contains(&&set[0..=2]) {
+            if ["HP1", "FAB", "HER", "WIN", "JDG"].contains(&&set[0..=2]) {
                 continue;
             }
             let art_variations = row[headers["Art Variations"]].to_string();
@@ -144,6 +144,10 @@ impl CardImageDB {
         Self { uuid_card_map: map }
     }
 
+    pub fn init() -> Self {
+        Self::build(&URL_FILE)
+    }
+
     pub fn load_card_image(&self, name: &str, pitch: &Option<u32>) -> UMat {
         let key = (name.to_string(), pitch.to_owned());
         let url = self
@@ -151,7 +155,7 @@ impl CardImageDB {
             .get(&key)
             .expect(&format!("{:?} not found in card image db", key));
 
-        let mut image_mat = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
+        let mut image_mat = UMat::new_def();
         let img_vec = reqwest::blocking::get(url)
             .unwrap()
             .bytes()
@@ -161,21 +165,38 @@ impl CardImageDB {
         let img = imdecode(&img_vec, IMREAD_UNCHANGED).unwrap();
 
         img.copy_to(&mut image_mat).unwrap();
+        // I don't totally understand this, but Splatter Skull had a depth of 2 whereas every other
+        // image has a depth of 0, so this catches that case
+        if image_mat.depth() > 0 {
+            image_mat
+                .clone()
+                .convert_to(&mut image_mat, CV_8U, 1.0 / 256.0, 0.0)
+                .unwrap();
+        }
 
         let img = convert_alpha_to_white(&image_mat).unwrap();
         cvt_color_def(&img, &mut image_mat, COLOR_RGBA2RGB).unwrap();
 
-        // I don't totally understand this, but Splatter Skull had a depth of 2 whereas every other
-        // image has a depth of 0, so this catches that case
-        if image_mat.depth() > 0 {
-            opencv::prelude::UMatTraitConst::convert_to_def(
-                &image_mat.clone(),
-                &mut image_mat,
-                CV_8U,
-            )
-            .unwrap();
-        }
-
         return image_mat;
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::CardImageDB;
+    use opencv::highgui;
+
+    #[test]
+    fn test_load_image() -> Result<(), Box<dyn std::error::Error>> {
+        let url_file = std::env::current_dir()?
+            .parent()
+            .unwrap()
+            .join("data/card_data.csv");
+
+        let card_db = CardImageDB::build(url_file.to_str().unwrap());
+        let img = card_db.load_card_image("Erase Face", &Some(1));
+        highgui::imshow("display", &img)?;
+        highgui::wait_key(0)?;
+        Ok(())
     }
 }

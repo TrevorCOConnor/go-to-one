@@ -4,6 +4,8 @@ use opencv::{
     Error,
 };
 
+use crate::image::copy_to;
+
 #[derive(Debug)]
 pub struct RelativeRoiError(String);
 
@@ -18,6 +20,9 @@ impl std::error::Error for RelativeRoiError {}
 pub fn center_offset(inner: i32, outer: i32) -> i32 {
     (outer - inner).div_euclid(2)
 }
+pub fn center_offset_f64(inner: f64, outer: f64) -> f64 {
+    (outer - inner) / 2.0
+}
 
 #[derive(Copy, Clone)]
 pub struct RelativeRoi {
@@ -25,30 +30,31 @@ pub struct RelativeRoi {
     y: f64,
     width: f64,
     height: f64,
-    horizontal_buffer: f64,
-    vertical_buffer: f64,
-    horizontal_partition: Option<HorizontalPartition>,
-    vertical_partition: Option<VerticalPartition>,
+    left_horizontal_buffer: f64,
+    right_horizontal_buffer: f64,
+    top_vertical_buffer: f64,
+    bottom_vertical_buffer: f64,
 }
 
 impl RelativeRoi {
-    /// # Arguments
-    /// * `x` - x-axis offset proportional to the whole frame
-    /// * `y` - y-axis offset proportional to the whole frame
-    /// * `width` - width of the subregion proportional to the whole frame
-    /// * `height` - height of the subregion proportional to the whole frame
-    /// * `horizontal_buffer` - optional value to set a buffer between the left and right sides of
-    /// the subregion
-    /// * `vertical_buffer` - optional value to set a buffer between the top and bottom of the sub
-    /// region
-    pub fn build(
+    pub fn get_height(&self) -> f64 {
+        self.height
+    }
+
+    pub fn get_width(&self) -> f64 {
+        self.width
+    }
+
+    fn validate_inputs(
         x: f64,
         y: f64,
         width: f64,
         height: f64,
-        horizontal_buffer: Option<f64>,
-        vertical_buffer: Option<f64>,
-    ) -> Result<Self, RelativeRoiError> {
+        left_horizontal_buffer: f64,
+        right_horizontal_buffer: f64,
+        top_vertical_buffer: f64,
+        bottom_vertical_buffer: f64,
+    ) -> Result<(), RelativeRoiError> {
         // `x` is a valid percentage
         if x < 0.0 || x > 1.0 {
             return Err(RelativeRoiError(
@@ -92,28 +98,61 @@ impl RelativeRoi {
         }
 
         // horizontal_buffer check
-        if 2.0 * horizontal_buffer.unwrap_or(0.0) >= width {
+        if left_horizontal_buffer + right_horizontal_buffer >= width {
             return Err(RelativeRoiError(
                 "`horizontal_buffer` must be less than half of  `width`.".to_string(),
             ));
         }
 
         // vertical_buffer check
-        if 2.0 * vertical_buffer.unwrap_or(0.0) >= height {
+        if top_vertical_buffer + bottom_vertical_buffer >= height {
             return Err(RelativeRoiError(
                 "`vertical_buffer` must be less than half of `height`.".to_string(),
             ));
         }
+
+        Ok(())
+    }
+
+    /// # Arguments
+    /// * `x` - x-axis offset proportional to the whole frame
+    /// * `y` - y-axis offset proportional to the whole frame
+    /// * `width` - width of the subregion proportional to the whole frame
+    /// * `height` - height of the subregion proportional to the whole frame
+    /// * `horizontal_buffer` - optional value to set a buffer between the left and right sides of
+    /// the subregion
+    /// * `vertical_buffer` - optional value to set a buffer between the top and bottom of the sub
+    /// region
+    pub fn build_def(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        horizontal_buffer: Option<f64>,
+        vertical_buffer: Option<f64>,
+    ) -> Result<Self, RelativeRoiError> {
+        let horizontal_buffer = horizontal_buffer.unwrap_or(0.0);
+        let vertical_buffer = vertical_buffer.unwrap_or(0.0);
+        Self::validate_inputs(
+            x,
+            y,
+            width,
+            height,
+            horizontal_buffer,
+            horizontal_buffer,
+            vertical_buffer,
+            vertical_buffer,
+        )?;
 
         Ok(Self {
             x,
             y,
             width,
             height,
-            horizontal_buffer: horizontal_buffer.unwrap_or(0.0),
-            vertical_buffer: vertical_buffer.unwrap_or(0.0),
-            horizontal_partition: None,
-            vertical_partition: None,
+            left_horizontal_buffer: horizontal_buffer,
+            right_horizontal_buffer: horizontal_buffer,
+            top_vertical_buffer: vertical_buffer,
+            bottom_vertical_buffer: vertical_buffer,
         })
     }
 
@@ -136,71 +175,78 @@ impl RelativeRoi {
         horizontal_partition: Option<HorizontalPartition>,
         vertical_partition: Option<VerticalPartition>,
     ) -> Result<Self, RelativeRoiError> {
-        // `x` is a valid percentage
-        if x < 0.0 || x > 1.0 {
-            return Err(RelativeRoiError(
-                "`x` value cannot be less than 0 or greater than 1.".to_string(),
-            ));
-        }
+        let horizontal_buffer = horizontal_buffer.unwrap_or(0.0);
+        let vertical_buffer = vertical_buffer.unwrap_or(0.0);
 
-        // `y` is a valid percentage
-        if y < 0.0 || y > 1.0 {
-            return Err(RelativeRoiError(
-                "`y` value cannot be less than 0 or greater than 1.".to_string(),
-            ));
-        }
+        let (left_horizontal_buffer, right_horizontal_buffer) = {
+            if let Some(part) = horizontal_partition {
+                part.split_horizontal_buffer(horizontal_buffer)
+            } else {
+                (horizontal_buffer, horizontal_buffer)
+            }
+        };
 
-        // `width` is a valid percentage
-        if width < 0.0 || width > 1.0 {
-            return Err(RelativeRoiError(
-                "`width` value cannot be less than 0 or greater than 1.".to_string(),
-            ));
-        }
+        let (top_vertical_buffer, bottom_vertical_buffer) = {
+            if let Some(part) = vertical_partition {
+                part.split_vertical_buffer(vertical_buffer)
+            } else {
+                (vertical_buffer, vertical_buffer)
+            }
+        };
 
-        // `height` is a valid percentage
-        if height < 0.0 || height > 1.0 {
-            return Err(RelativeRoiError(
-                "`height` value cannot be less than 0 or greater than 1.".to_string(),
-            ));
-        }
-
-        // x dimensions add up to less than 1
-        if width + x > 1.0 {
-            return Err(RelativeRoiError(
-                "`x` and `width` cannot add up to more than 1.".to_string(),
-            ));
-        }
-
-        // y dimensions add up to less than 1
-        if height + y > 1.0 {
-            return Err(RelativeRoiError(
-                "`y` and `height` cannot add up to more than 1.".to_string(),
-            ));
-        }
-
-        // horizontal_buffer check
-        if 2.0 * horizontal_buffer.unwrap_or(0.0) >= width {
-            return Err(RelativeRoiError(
-                "`horizontal_buffer` must be less than half of  `width`.".to_string(),
-            ));
-        }
-
-        // vertical_buffer check
-        if 2.0 * vertical_buffer.unwrap_or(0.0) >= height {
-            return Err(RelativeRoiError(
-                "`vertical_buffer` must be less than half of `height`.".to_string(),
-            ));
-        }
+        Self::validate_inputs(
+            x,
+            y,
+            width,
+            height,
+            left_horizontal_buffer,
+            right_horizontal_buffer,
+            top_vertical_buffer,
+            bottom_vertical_buffer,
+        )?;
 
         Ok(Self {
             x,
             y,
             width,
             height,
-            horizontal_buffer: horizontal_buffer.unwrap_or(0.0),
-            vertical_buffer: vertical_buffer.unwrap_or(0.0),
-            horizontal_partition,
-            vertical_partition,
+            left_horizontal_buffer,
+            right_horizontal_buffer,
+            top_vertical_buffer,
+            bottom_vertical_buffer,
+        })
+    }
+
+    pub fn build(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        left_horizontal_buffer: f64,
+        right_horizontal_buffer: f64,
+        top_vertical_buffer: f64,
+        bottom_vertical_buffer: f64,
+    ) -> Result<Self, RelativeRoiError> {
+        Self::validate_inputs(
+            x,
+            y,
+            width,
+            height,
+            left_horizontal_buffer,
+            right_horizontal_buffer,
+            top_vertical_buffer,
+            bottom_vertical_buffer,
+        )?;
+
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            left_horizontal_buffer,
+            right_horizontal_buffer,
+            top_vertical_buffer,
+            bottom_vertical_buffer,
         })
     }
 
@@ -210,33 +256,10 @@ impl RelativeRoi {
         let ratio = umat.cols() as f64 / umat.rows() as f64;
 
         // calculate buffer dimensions
-        let horizontal_buffer = self.horizontal_buffer * region_size.width as f64;
-        let vertical_buffer = self.vertical_buffer * region_size.height as f64;
-
-        let left_horizontal_buffer = match self.horizontal_partition {
-            None => horizontal_buffer,
-            Some(HorizontalPartition::Left) => horizontal_buffer,
-            Some(HorizontalPartition::Center) => horizontal_buffer * 0.5,
-            Some(HorizontalPartition::Right) => horizontal_buffer * 0.5,
-        };
-        let right_horizontal_buffer = match self.horizontal_partition {
-            None => horizontal_buffer,
-            Some(HorizontalPartition::Left) => horizontal_buffer * 0.5,
-            Some(HorizontalPartition::Center) => horizontal_buffer * 0.5,
-            Some(HorizontalPartition::Right) => horizontal_buffer,
-        };
-        let top_vertical_buffer = match self.vertical_partition {
-            None => vertical_buffer,
-            Some(VerticalPartition::Top) => vertical_buffer,
-            Some(VerticalPartition::Center) => vertical_buffer * 0.5,
-            Some(VerticalPartition::Bottom) => vertical_buffer * 0.5,
-        };
-        let bottom_vertical_buffer = match self.vertical_partition {
-            None => vertical_buffer,
-            Some(VerticalPartition::Top) => vertical_buffer * 0.5,
-            Some(VerticalPartition::Center) => vertical_buffer * 0.5,
-            Some(VerticalPartition::Bottom) => vertical_buffer,
-        };
+        let left_horizontal_buffer = self.left_horizontal_buffer * region_size.width as f64;
+        let right_horizontal_buffer = self.right_horizontal_buffer * region_size.width as f64;
+        let top_vertical_buffer = self.top_vertical_buffer * region_size.height as f64;
+        let bottom_vertical_buffer = self.bottom_vertical_buffer * region_size.height as f64;
 
         // calculate outer dimensions of subregion
         let outer_x = self.x * region_size.width as f64;
@@ -286,33 +309,10 @@ impl RelativeRoi {
     /// Generates rect given full frame size
     pub fn generate_roi_raw(&self, region_size: &Size) -> Rect {
         // calculate buffer dimensions
-        let horizontal_buffer = self.horizontal_buffer * region_size.width as f64;
-        let vertical_buffer = self.vertical_buffer * region_size.height as f64;
-
-        let left_horizontal_buffer = match self.horizontal_partition {
-            None => horizontal_buffer,
-            Some(HorizontalPartition::Left) => horizontal_buffer,
-            Some(HorizontalPartition::Center) => horizontal_buffer * 0.5,
-            Some(HorizontalPartition::Right) => horizontal_buffer * 0.5,
-        };
-        let right_horizontal_buffer = match self.horizontal_partition {
-            None => horizontal_buffer,
-            Some(HorizontalPartition::Left) => horizontal_buffer * 0.5,
-            Some(HorizontalPartition::Center) => horizontal_buffer * 0.5,
-            Some(HorizontalPartition::Right) => horizontal_buffer,
-        };
-        let top_vertical_buffer = match self.vertical_partition {
-            None => vertical_buffer,
-            Some(VerticalPartition::Top) => vertical_buffer,
-            Some(VerticalPartition::Center) => vertical_buffer * 0.5,
-            Some(VerticalPartition::Bottom) => vertical_buffer * 0.5,
-        };
-        let bottom_vertical_buffer = match self.vertical_partition {
-            None => vertical_buffer,
-            Some(VerticalPartition::Top) => vertical_buffer * 0.5,
-            Some(VerticalPartition::Center) => vertical_buffer * 0.5,
-            Some(VerticalPartition::Bottom) => vertical_buffer,
-        };
+        let left_horizontal_buffer = self.left_horizontal_buffer * region_size.width as f64;
+        let right_horizontal_buffer = self.right_horizontal_buffer * region_size.width as f64;
+        let top_vertical_buffer = self.top_vertical_buffer * region_size.height as f64;
+        let bottom_vertical_buffer = self.bottom_vertical_buffer * region_size.height as f64;
 
         // calculate outer dimensions of subregion
         let outer_x = self.x * region_size.width as f64;
@@ -341,6 +341,60 @@ impl RelativeRoi {
         resize_def(umat, &mut output, rect.size())?;
         Ok(output)
     }
+
+    pub fn copy_to(&self, img: &UMat, frame: &mut UMat) -> Result<(), Box<dyn std::error::Error>> {
+        let roi_rect = self.generate_roi(&frame.size()?, img);
+        let resized = self.resize(&frame.size()?, img)?;
+        copy_to(&resized, frame, &roi_rect)
+    }
+
+    fn scale_rel(&self, scale: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        let new_width = self.width * scale;
+        let new_height = self.height * scale;
+        let x_offset = center_offset_f64(self.width, new_width);
+        let y_offset = center_offset_f64(self.height, new_height);
+
+        let new_x = self.x - x_offset;
+        let new_y = self.y - y_offset;
+
+        let new_rel = Self::build(
+            new_x,
+            new_y,
+            new_width,
+            new_height,
+            self.left_horizontal_buffer,
+            self.right_horizontal_buffer,
+            self.top_vertical_buffer,
+            self.bottom_vertical_buffer,
+        )?;
+        Ok(new_rel)
+    }
+
+    pub fn scale_rel_safe(&self, scale: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        if scale <= 0.0 {
+            return Err(RelativeRoiError(format!(
+                "Cannot scale a RelativeRoi by a non-positive number: {}",
+                scale
+            ))
+            .into());
+        }
+
+        if scale <= 1.0 {
+            return self.scale_rel(scale);
+        }
+
+        let left_bound = (self.width + 2.0 * self.x) / self.width;
+        let right_bound = (self.width + 2.0 * (1.0 - self.x - self.width)) / self.width;
+        let top_bound = (self.height + 2.0 * self.y) / self.height;
+        let bottom_bound = (self.height + 2.0 * (1.0 - self.y - self.height)) / self.height;
+
+        let minimum = [left_bound, right_bound, top_bound, bottom_bound]
+            .into_iter()
+            .reduce(f64::min)
+            .unwrap();
+
+        self.scale_rel(minimum)
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -350,9 +404,29 @@ pub enum HorizontalPartition {
     Right,
 }
 
+impl HorizontalPartition {
+    fn split_horizontal_buffer(&self, buffer: f64) -> (f64, f64) {
+        match self {
+            HorizontalPartition::Left => (buffer, 0.5 * buffer),
+            HorizontalPartition::Right => (0.5 * buffer, buffer),
+            HorizontalPartition::Center => (buffer, buffer),
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub enum VerticalPartition {
     Top,
     Center,
     Bottom,
+}
+
+impl VerticalPartition {
+    fn split_vertical_buffer(&self, buffer: f64) -> (f64, f64) {
+        match self {
+            VerticalPartition::Top => (buffer, 0.5 * buffer),
+            VerticalPartition::Center => (buffer, buffer),
+            VerticalPartition::Bottom => (0.5 * buffer, buffer),
+        }
+    }
 }

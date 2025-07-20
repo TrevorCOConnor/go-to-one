@@ -1,7 +1,11 @@
+use std::{borrow::BorrowMut, collections::HashMap};
+
 use opencv::{
-    core::{Rect, Size, UMat, UMatTraitConst},
-    imgproc, Error,
+    core::{MatTraitConst, Rect, Size, UMat, UMatTrait, UMatTraitConst},
+    imgcodecs, imgproc, Error,
 };
+
+use crate::err::RoiError;
 
 const ART_RATIO: f64 = 3.0 / 5.0;
 const BORDER_X_RATIO: f64 = 1.0 / 30.0;
@@ -87,5 +91,93 @@ pub fn get_card_art_progressive(
     let mut cropped = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
     UMat::roi(image, roi)?.copy_to(&mut cropped)?;
 
+    Ok(cropped)
+}
+
+pub fn load_image(fp: &str) -> Result<UMat, opencv::error::Error> {
+    let mut umat = UMat::new_def();
+    let img = imgcodecs::imread(fp, imgcodecs::IMREAD_COLOR)?;
+    img.copy_to(&mut umat)?;
+
+    Ok(umat)
+}
+
+pub fn load_image_unchanged(fp: &str) -> Result<UMat, opencv::error::Error> {
+    let mut umat = UMat::new_def();
+    // let img = imgcodecs::imread(fp, imgcodecs::IMREAD_COLOR)?;
+    let img = imgcodecs::imread(fp, imgcodecs::IMREAD_UNCHANGED)?;
+    img.copy_to(&mut umat)?;
+
+    Ok(umat)
+}
+
+pub struct FullArtHeroManager {
+    map: HashMap<String, String>,
+}
+
+impl FullArtHeroManager {
+    pub fn new() -> Self {
+        Self {
+            map: load_full_art_hero_map(),
+        }
+    }
+
+    /// Loads the hero art animation for a given hero
+    pub fn get_hero_art_animation_fp(
+        &self,
+        hero_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(fp) = self.map.get(hero_name) {
+            Ok(format!("data/full_art_heroes/{}", fp))
+        } else {
+            Err(Box::new(Error::new(500, format!("Could not find full art animation for hero '{}' in the config file. An update is likely needed.", hero_name))))
+        }
+    }
+
+    /// Loads only the top half fo the hero art animation
+    pub fn crop_hero_img(hero_mat: &UMat) -> Result<UMat, Box<dyn std::error::Error>> {
+        let roi = hero_mat.roi(Rect::new(
+            0,
+            0,
+            hero_mat.size()?.width,
+            ((hero_mat.size()?.height) as f64 * (2.0 / 3.0)) as i32,
+        ))?;
+
+        let mut half_frame = UMat::new_def();
+        roi.copy_to(&mut half_frame)?;
+        Ok(half_frame)
+    }
+}
+
+fn load_full_art_hero_map() -> HashMap<String, String> {
+    let file = std::fs::File::open("data/full_art_hero_map.json")
+        .expect("Can't find full art hero json file.");
+    let json: HashMap<String, String> =
+        serde_json::from_reader(file).expect("Full art json file incorrectly formatted.");
+    json
+}
+
+pub fn copy_to(
+    img: &UMat,
+    background: &mut UMat,
+    roi: &Rect,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if img.size()?.width != roi.width {
+        return Err(RoiError::TooWide.into());
+    }
+
+    if img.size()?.height != roi.height {
+        return Err(RoiError::TooTall.into());
+    }
+
+    let mut roi_ref = background.roi_mut(*roi)?;
+    img.copy_to(roi_ref.borrow_mut())?;
+    Ok(())
+}
+
+pub fn crop(img: &UMat, roi: &Rect) -> Result<UMat, Box<dyn std::error::Error>> {
+    let mut cropped = UMat::new_def();
+    let crop_roi = img.roi(*roi)?;
+    crop_roi.copy_to(&mut cropped)?;
     Ok(cropped)
 }

@@ -1,4 +1,3 @@
-use chrono;
 use clap::Parser;
 use libmpv::{FileState, Mpv};
 use std::{
@@ -37,11 +36,8 @@ struct Cli {
     #[arg(short, long)]
     video_file: String,
 
-    #[arg(long, alias = "p1")]
-    player1: String,
-
-    #[arg(short, alias = "p2")]
-    player2: String,
+    #[arg(short, long)]
+    output_fp: String,
 
     #[arg(short, long, action)]
     update_db: bool,
@@ -54,6 +50,7 @@ enum Command {
     UNDO,
     WIN1,
     WIN2,
+    ZOOM,
 }
 
 impl Command {
@@ -65,6 +62,7 @@ impl Command {
             Command::UNDO,
             Command::WIN1,
             Command::WIN2,
+            Command::ZOOM,
         ])
     }
 }
@@ -78,6 +76,7 @@ impl Named for Command {
             Command::UNDO => ":u",
             Command::WIN1 => ":w1",
             Command::WIN2 => ":w2",
+            Command::ZOOM => ":z",
         }
     }
 }
@@ -101,23 +100,33 @@ fn is_life_update(text: &str) -> bool {
     text.starts_with(":h")
 }
 
+/// Expected format:
+/// :h1 -2
+/// :h 1 - 2
+/// :h1 - 2
+/// :h1-2
 fn extract_life_update(text: &str) -> Option<(u8, String)> {
     let mut player = None;
     let mut update = None;
 
-    let splits: Vec<&str> = text.split(" ").filter(|v| !v.is_empty()).collect();
-    if splits.len() >= 3 && splits.first() == Some(&&":h") {
+    let (cmd, args) = text.split_at(2);
+    let args: Vec<char> = args.chars().filter(|c| !c.is_whitespace()).collect();
+
+    let player_char = args.first();
+    let update_str = args[1..].iter().collect::<String>();
+
+    if cmd == ":h" {
         // Parse player
-        if splits[1] == "1" {
+        if player_char == Some(&'1') {
             player.replace(1);
         }
-        if splits[1] == "2" {
+        if player_char == Some(&'2') {
             player.replace(2);
         }
 
         // Parse update
-        if LifeTracker::parse_update(splits[2]).is_ok() {
-            update.replace(splits[2]);
+        if LifeTracker::parse_update(&update_str).is_ok() {
+            update.replace(&update_str);
         }
     }
     if player.is_some() && update.is_some() {
@@ -126,15 +135,27 @@ fn extract_life_update(text: &str) -> Option<(u8, String)> {
     return None;
 }
 
+/// Makes string title case (assumes one word -- sue me)
+fn title_case(txt: &str) -> String {
+    let mut txt = txt.to_owned();
+    let tail = txt.split_off(1);
+    let mut txt = txt.to_uppercase();
+    txt.push_str(&tail.to_lowercase());
+    txt
+}
+
 #[derive(PartialEq, Eq)]
 enum UpdateType {
     Life,
     Card,
+    Player1,
+    Player2,
     Hero1,
     Hero2,
     Turn,
     Win1,
     Win2,
+    Zoom,
 }
 
 impl UpdateType {
@@ -143,10 +164,13 @@ impl UpdateType {
             UpdateType::Card => "card".to_string(),
             UpdateType::Life => "life".to_string(),
             UpdateType::Turn => "turn".to_string(),
+            UpdateType::Player1 => "player1".to_string(),
+            UpdateType::Player2 => "player2".to_string(),
             UpdateType::Hero1 => "hero1".to_string(),
             UpdateType::Hero2 => "hero2".to_string(),
             UpdateType::Win1 => "win1".to_string(),
             UpdateType::Win2 => "win2".to_string(),
+            UpdateType::Zoom => "zoom".to_string(),
         }
     }
 }
@@ -185,11 +209,31 @@ struct RecordKeeper {
 }
 
 impl RecordKeeper {
-    fn build(hero1: &CardData, hero2: &CardData, first: &str) -> RecordKeeper {
+    fn build(hero1: (&str, &CardData), hero2: (&str, &CardData), first: &str) -> RecordKeeper {
         let mut rk = RecordKeeper {
             records: Vec::new(),
         };
+        let (player1, hero1) = hero1;
+        let (player2, hero2) = hero2;
 
+        let player1_record = Record {
+            sec: 0,
+            milli: 0,
+            name: Some(title_case(player1)),
+            pitch: None,
+            player1_life: None,
+            player2_life: None,
+            update_type: UpdateType::Player1,
+        };
+        let player2_record = Record {
+            sec: 0,
+            milli: 0,
+            name: Some(title_case(player2)),
+            pitch: None,
+            player1_life: None,
+            player2_life: None,
+            update_type: UpdateType::Player2,
+        };
         let hero1_record = Record {
             sec: 0,
             milli: 0,
@@ -209,11 +253,15 @@ impl RecordKeeper {
             update_type: UpdateType::Hero2,
         };
         if first == "1" {
+            rk.records.push(player1_record);
+            rk.records.push(player2_record);
             rk.records.push(hero1_record);
             rk.records.push(hero2_record);
         } else {
-            rk.records.push(hero1_record);
+            rk.records.push(player2_record);
+            rk.records.push(player1_record);
             rk.records.push(hero2_record);
+            rk.records.push(hero1_record);
         }
 
         rk
@@ -300,6 +348,21 @@ impl RecordKeeper {
         self.records.push(record);
     }
 
+    fn add_zoom_update(&mut self, mpv: &Mpv) {
+        let (sec, milli) = Self::get_time(mpv);
+        let update_type = UpdateType::Zoom;
+        let record = Record {
+            sec,
+            milli,
+            name: None,
+            pitch: None,
+            player1_life: None,
+            player2_life: None,
+            update_type,
+        };
+        self.records.push(record);
+    }
+
     fn sort_records(&mut self) {
         self.records.sort_by_key(|v| (v.sec, v.milli));
     }
@@ -309,6 +372,8 @@ async fn handle_events(
     output_fp: &str,
     mpv: &Mpv,
     cards: &[CardData],
+    player1: &str,
+    player2: &str,
     hero1: &CardData,
     hero2: &CardData,
     first: &str,
@@ -320,7 +385,7 @@ async fn handle_events(
 
     let mut output_file = File::create(output_fp).expect("Couldn't write to file");
 
-    let mut record_keeper = RecordKeeper::build(hero1, hero2, first);
+    let mut record_keeper = RecordKeeper::build((player1, hero1), (player2, hero2), first);
 
     mpv.unpause().unwrap();
 
@@ -346,9 +411,11 @@ async fn handle_events(
                                     KeyCode::Enter => {
                                         if let Some((player, update)) = extract_life_update(&text) {
                                             record_keeper.add_player_life_update(&mpv, player, &update);
+                                            display_line_to_user("Player health updated");
+                                            text = String::new();
+                                        } else {
+                                            display_line_to_user("Invalid life format.");
                                         }
-                                        display_line_to_user("Player health updated");
-                                        text = String::new();
                                     },
                                     KeyCode::Char(c) => {
                                         text.push(c);
@@ -406,6 +473,10 @@ async fn handle_events(
                                                 record_keeper.add_winner_update(mpv, 2);
                                                 display_line_to_user("Player 2 declared winner");
                                                 break;
+                                            }
+                                            Command::ZOOM => {
+                                                record_keeper.add_zoom_update(mpv);
+                                                display_line_to_user("Zoom triggered");
                                             }
                                             _ => {
                                             }
@@ -517,20 +588,25 @@ async fn main() -> std::io::Result<()> {
     mpv.pause().unwrap();
 
     // Get player names
-    let output_fp = format!(
-        "annotations/{}_v_{}_{}.tsv",
-        args.player1,
-        args.player2,
-        chrono::Local::now()
-    );
+    let output_fp = format!("annotations/{}.tsv", args.output_fp);
     let card_db = lib::card::CardDB::init();
 
     let heroes = card_db.heroes();
 
+    let mut player1 = String::new();
+    println!("Enter Player 1's name (left player):");
+    std::io::stdin().read_line(&mut player1)?;
+    let player1 = player1.trim();
+
+    let mut player2 = String::new();
+    println!("Enter Player 2's name (right player):");
+    std::io::stdin().read_line(&mut player2)?;
+    let player2 = player2.trim();
+
     enable_raw_mode()?;
-    println!("Enter hero 1:");
+    println!("Enter hero for {}:", player1);
     let hero1 = lib::commands::enter_card(&heroes).await;
-    println!("Enter hero 2:");
+    println!("Enter hero for {}:", player2);
     let hero2 = lib::commands::enter_card(&heroes).await;
     println!("Enter player going first:");
     let options = Vec::from([
@@ -563,7 +639,17 @@ async fn main() -> std::io::Result<()> {
 
     execute!(&mut stdout())?;
 
-    handle_events(&output_fp, &mpv, &card_db.cards, hero1, hero2, first.text()).await;
+    handle_events(
+        &output_fp,
+        &mpv,
+        &card_db.cards,
+        &player1,
+        &player2,
+        hero1,
+        hero2,
+        first.text(),
+    )
+    .await;
 
     disable_raw_mode()
 }

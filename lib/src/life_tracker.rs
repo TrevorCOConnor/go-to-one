@@ -50,10 +50,10 @@ impl LifeTracker {
         let val = update
             .get(1..)
             .expect("Update missing value")
-            .parse::<i32>()
+            .parse::<u32>()
             .map_err(|_| "Update value is not an integer")?;
 
-        Ok((operation, val))
+        Ok((operation, val as i32))
     }
 
     pub fn update(&mut self, update: &str) {

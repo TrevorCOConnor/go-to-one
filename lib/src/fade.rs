@@ -1,12 +1,12 @@
 use opencv::{
     boxed_ref::BoxedRefMut,
     core::{
-        add_weighted, bitwise_and, bitwise_not, bitwise_or, in_range, no_array, Rect, Scalar, UMat,
-        UMatTrait, UMatTraitConst,
+        add_weighted, bitwise_and, bitwise_not, bitwise_or, in_range, no_array, Rect, Scalar,
+        ToInputArray, UMat, UMatTrait, UMatTraitConst,
     },
 };
 
-const COLOR_LENIENCY: f64 = 100.0;
+const COLOR_LENIENCY: f64 = 90.0;
 
 fn determine_region_fade_percentage(
     roi: &BoxedRefMut<UMat>,
@@ -152,7 +152,7 @@ pub fn overlay_image_roi_sectional_with_removal(
 }
 
 pub fn remove_color(
-    background: &UMat,
+    background: &impl ToInputArray,
     foreground: &UMat,
     target_color: &Scalar,
 ) -> Result<UMat, Box<dyn std::error::Error>> {
@@ -187,7 +187,7 @@ pub fn remove_color(
 }
 
 pub fn remove_white_corners(
-    background: &UMat,
+    background: &impl ToInputArray,
     foreground: &UMat,
 ) -> Result<UMat, Box<dyn std::error::Error>> {
     let mut out_mask = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
@@ -242,7 +242,7 @@ pub fn remove_white_corners(
 }
 
 pub fn convert_alpha_to_white(image: &UMat) -> Result<UMat, Box<dyn std::error::Error>> {
-    let mut alpha_mask = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
+    let mut alpha_mask = UMat::new_def();
 
     in_range(
         image,
@@ -251,13 +251,12 @@ pub fn convert_alpha_to_white(image: &UMat) -> Result<UMat, Box<dyn std::error::
         &mut alpha_mask,
     )?;
 
-    let mut new = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
-    let white_mat = UMat::new_rows_cols_with_default(
+    let mut new = UMat::new_def();
+    let white_mat = UMat::new_rows_cols_with_default_def(
         image.rows(),
         image.cols(),
         image.typ(),
         Scalar::new(255.0, 255.0, 255.0, 255.0),
-        opencv::core::UMatUsageFlags::USAGE_DEFAULT,
     )?;
     bitwise_or(&image, &white_mat, &mut new, &alpha_mask)
         .expect("converting alpha to white mask failed");

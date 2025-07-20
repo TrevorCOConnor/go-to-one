@@ -17,6 +17,10 @@ impl Sub for Coord {
 }
 
 impl Coord {
+    pub fn new(x: f64, y: f64) -> Self {
+        Self(x, y)
+    }
+
     pub fn scale(&self, scalar: f64) -> Self {
         Coord(self.0 * scalar, self.1 * scalar)
     }
