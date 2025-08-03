@@ -1,13 +1,15 @@
 use opencv::{
-    calib3d::find_homography,
+    calib3d::{ find_homography_def},
     core::{no_array, Point2f, Scalar, Size, UMat, Vector, BORDER_CONSTANT},
-    imgproc::{cvt_color_def, warp_perspective, COLOR_RGBA2RGB, INTER_LINEAR},
+    imgproc::{cvt_color_def, warp_perspective, COLOR_RGBA2RGB, INTER_NEAREST},
     prelude::*,
 };
 use std::error::Error;
 use std::f32::consts::E;
 
 const CARD_HEIGHT_EXT: f32 = 0.08;
+// Bright blue
+pub const REMOVAL_COLOR: Scalar = Scalar::new(252.0, 116.0, 5.0, 0.0);
 
 fn rotate_function(percent: f32) -> f32 {
     let scalar = (E.powi(2) - 1.0).recip();
@@ -86,7 +88,7 @@ pub fn rotate_image(
     let output_size = Size::new(width as i32, ((1.0 + CARD_HEIGHT_EXT) * height) as i32);
 
     // Calculate the homography
-    let homography = find_homography(&src_points, &dst_points, &mut no_array(), 0, 0.0)?;
+    let homography = find_homography_def(&src_points, &dst_points, &mut no_array())?;
 
     // Warp the image for the current frame
     let mut warped_frame = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
@@ -95,9 +97,9 @@ pub fn rotate_image(
         &mut warped_frame,
         &homography,
         output_size,
-        INTER_LINEAR,
+        INTER_NEAREST,
         BORDER_CONSTANT,
-        Scalar::new(0.0, 255.0, 0.0, 0.0),
+        REMOVAL_COLOR
     )?;
 
     cvt_color_def(&warped_frame.clone(), &mut warped_frame, COLOR_RGBA2RGB)?;

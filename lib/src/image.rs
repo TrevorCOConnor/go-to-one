@@ -134,6 +134,18 @@ impl FullArtHeroManager {
         }
     }
 
+    /// Loads the hero art animation for a given hero
+    pub fn get_cropped_hero_art_animation_fp(
+        &self,
+        hero_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(fp) = self.map.get(hero_name) {
+            Ok(format!("data/full_art_heroes/cropped_{}", fp))
+        } else {
+            Err(Box::new(Error::new(500, format!("Could not find full art animation for hero '{}' in the config file. An update is likely needed.", hero_name))))
+        }
+    }
+
     /// Loads only the top half fo the hero art animation
     pub fn crop_hero_img(hero_mat: &UMat) -> Result<UMat, Box<dyn std::error::Error>> {
         let roi = hero_mat.roi(Rect::new(

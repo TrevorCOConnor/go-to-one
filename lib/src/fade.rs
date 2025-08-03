@@ -1,12 +1,11 @@
 use opencv::{
     boxed_ref::BoxedRefMut,
     core::{
-        add_weighted, bitwise_and, bitwise_not, bitwise_or, in_range, no_array, Rect, Scalar,
-        ToInputArray, UMat, UMatTrait, UMatTraitConst,
+        add_weighted, bitwise_and, bitwise_not, bitwise_not_def, bitwise_or, bitwise_or_def, in_range, no_array, Rect, Scalar, ToInputArray, UMat, UMatTrait, UMatTraitConst
     },
 };
 
-const COLOR_LENIENCY: f64 = 90.0;
+const COLOR_LENIENCY: f64 = 80.0;
 
 fn determine_region_fade_percentage(
     roi: &BoxedRefMut<UMat>,
@@ -156,32 +155,37 @@ pub fn remove_color(
     foreground: &UMat,
     target_color: &Scalar,
 ) -> Result<UMat, Box<dyn std::error::Error>> {
-    let mut out_mask = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
-    let mut in_mask = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
-
     let lower_bound = Scalar::new(
         target_color[0] - COLOR_LENIENCY,
         target_color[1] - COLOR_LENIENCY,
         target_color[2] - COLOR_LENIENCY,
-        0.0,
+        target_color[3] - COLOR_LENIENCY
     );
     let upper_bound = Scalar::new(
         target_color[0] + COLOR_LENIENCY,
         target_color[1] + COLOR_LENIENCY,
         target_color[2] + COLOR_LENIENCY,
-        0.0,
+        target_color[3] + COLOR_LENIENCY,
     );
 
+    let mut out_mask = UMat::new_def();
+    let mut in_mask = UMat::new_def();
+    // calculate sub-array to remove by finding colors within the spectrum
     in_range(foreground, &lower_bound, &upper_bound, &mut out_mask)?;
-    bitwise_not(&out_mask, &mut in_mask, &no_array()).expect("Bitwise not failed");
 
-    let mut out = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
-    let mut inn = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
+    // invert the sub-array to find the parts of the original image should remain
+    bitwise_not_def(&out_mask, &mut in_mask).expect("Bitwise not failed");
+
+    let mut out = UMat::new_def();
+    let mut inn = UMat::new_def();
+    // Create array of background pixels using the mask of pixels to be removed
     bitwise_and(background, background, &mut out, &out_mask)
         .expect("Bitwise-and for out mask failed");
+    // Create array of foreground pixels that will be kept
     bitwise_and(foreground, foreground, &mut inn, &in_mask)
         .expect("Bitwise-and for in mask failed");
-    bitwise_or(&out.clone(), &inn, &mut out, &no_array()).expect("Bitwise-or failed");
+    // Mash the two previous arrays together
+    bitwise_or_def(&out.clone(), &inn, &mut out).expect("Bitwise-or failed");
 
     Ok(out)
 }
@@ -228,8 +232,8 @@ pub fn remove_white_corners(
     bitwise_not(&out_mask, &mut in_mask, &no_array())
         .expect("bitwise_not in remove_white_corners failed");
 
-    let mut out = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
-    let mut inn = UMat::new(opencv::core::UMatUsageFlags::USAGE_DEFAULT);
+    let mut out = UMat::new_def();
+    let mut inn = UMat::new_def();
 
     bitwise_and(foreground, foreground, &mut inn, &in_mask)
         .expect("bitwise-and for in mask in remove_white_corners failed");
@@ -263,4 +267,40 @@ pub fn convert_alpha_to_white(image: &UMat) -> Result<UMat, Box<dyn std::error::
     bitwise_or(&image, &new.clone(), &mut new, &no_array()).expect("copying image to white failed");
 
     Ok(new)
+}
+
+
+#[cfg(test)]
+mod test {
+    use opencv::{core::{Scalar, Size, UMat, UMatTraitConst, Vector, CV_8U}, highgui::{wait_key, wait_key_ex_def}, imgcodecs::{imwrite, ImwriteFlags}, imgproc::{cvt_color_def, COLOR_BGR2BGRA, COLOR_BGRA2BGR, COLOR_RGBA2RGB}, viz::imshow_def};
+
+    use crate::{image::load_image, movement::resize_umat, rotate::rotate_image};
+
+    use super::{convert_alpha_to_white, remove_color, remove_white_corners};
+
+    #[test]
+    fn test_remove_color() -> Result<(), Box<dyn std::error::Error>> {
+        let fp = "data/remove.png";
+        // std::fs::remove_file(&fp)?;
+
+        let size = Size::new(500, 700);
+        let mut card_back = load_image("../data/cardback.png")?;
+        cvt_color_def(&card_back.clone(), &mut card_back, COLOR_BGRA2BGR)?;
+        let alpha = UMat::new_size_with_default_def(card_back.size()?, card_back.typ(), Scalar::new(252.0, 116.0, 5.0, 0.0))?;
+        let card_back = remove_white_corners(&alpha, &card_back)?;
+
+        let img = resize_umat(&card_back, &size)?;
+        let img = rotate_image(&img, 0.5, true)?;
+        let background = UMat::new_size_with_default_def(img.size()?, card_back.typ(), Scalar::new(0.0, 0.0, 255.0, 0.0))?;
+
+        let out = remove_color(&background, &img, &Scalar::new(252.0, 116.0, 5.0, 0.0))?;
+        let mut params = Vector::new();
+        params.push(ImwriteFlags::IMWRITE_PNG_COMPRESSION as i32);
+        params.push(9);
+
+        imwrite(fp, &out, &params)?;
+        // imwrite(fp, &img, &params)?;
+
+        Ok(())
+    }
 }

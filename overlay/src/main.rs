@@ -1,29 +1,30 @@
 use clap::Parser;
 use indicatif::ProgressBar;
+use log::{debug};
 
 use lib::{
     card::CardImageDB,
     fade::{convert_alpha_to_white, remove_color, remove_white_corners},
     image::{load_image, load_image_unchanged, FullArtHeroManager},
-    intro::{generate_intro, VideoCapLooper, INTRO_TIME},
+    intro::{generate_intro, VideoCapLooper, VideoCapLooperAdj, INTRO_TIME},
     life_tracker::LifeTracker,
     movement::{
         place_umat, relocate_umat, resize_umat, safe_scale, straight_line, MoveFunction,
         Reparameterization,
     },
     relative_roi::{center_offset, HorizontalPartition, RelativeRoi, VerticalPartition},
-    rotate::rotate_image,
+    rotate::{rotate_image, REMOVAL_COLOR},
     text::{center_text_at_rect, center_text_at_rel},
 };
 use opencv::{
-    core::{self, flip, Point, Rect, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
+    core::{self, flip, set_use_opencl, Point, Rect, Scalar, Size, UMat, UMatTrait, UMatTraitConst},
     imgproc::{
         self, cvt_color_def, COLOR_RGBA2RGB, FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SIMPLEX,
         LINE_8,
     },
     videoio::{
         self, VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst, VideoWriter,
-        VideoWriterTrait, CAP_PROP_FRAME_COUNT,
+        VideoWriterTrait, CAP_PROP_FRAME_COUNT, CAP_PROP_POS_FRAMES,
     },
 };
 use serde::Deserialize;
@@ -45,11 +46,10 @@ const FRAME_WIDTH: i32 = 1920;
 const FRAME_HEIGHT: i32 = 1080;
 
 // Colors
-const GREEN: Scalar = Scalar::new(0.0, 255.0, 0.0, 0.0);
 const WHITE: Scalar = Scalar::new(255.0, 255.0, 255.0, 0.0);
 
 // Background
-const BACKGROUND_ANIM_FILE: &'static str = "data/hexagon.mp4";
+const BACKGROUND_ANIM_FILE: &'static str = "data/smaller_hexagon.mp4";
 
 // Frame dimensions
 const FRAME_HEIGHT_RATIO: f64 = 1.0 - (1.0 / 64.0);
@@ -84,6 +84,7 @@ const HERO_DEF_COLOR: Scalar = Scalar::new(0.0, 0.0, 0.0, 0.0);
 const LIFE_TICK: f64 = 250.0;
 
 // File Constants
+const PLAYER1_DATA_TYPE: &str = "player1";
 const LIFE_DATA_TYPE: &str = "life";
 const CARD_DATA_TYPE: &str = "card";
 const TURN_DATA_TYPE: &str = "turn";
@@ -178,7 +179,7 @@ impl CardDisplayManager {
                     let roi = &frame.roi(rotated_rect)?;
 
                     let card_rotation =
-                        remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                        remove_color(&roi, &rotated, &REMOVAL_COLOR)?;
                     let mut inner_roi = frame.roi_mut(rotated_rect)?;
                     card_rotation.copy_to(&mut inner_roi)?;
                     Ok(())
@@ -195,7 +196,7 @@ impl CardDisplayManager {
                     let green = UMat::new_size_with_default_def(
                         display_card.size()?,
                         display_card.typ(),
-                        GREEN,
+                        REMOVAL_COLOR,
                     )?;
                     let card = remove_white_corners(&green, &display_card)?;
 
@@ -209,7 +210,7 @@ impl CardDisplayManager {
 
                     let mut roi = frame.roi_mut(rotated_rect)?;
                     let card_rotation =
-                        remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                        remove_color(&roi, &rotated, &REMOVAL_COLOR)?;
                     card_rotation.copy_to(&mut roi)?;
                     Ok(())
                 }
@@ -258,7 +259,7 @@ impl CardDisplayManager {
                     let green = UMat::new_size_with_default_def(
                         display_card.size()?,
                         display_card.typ(),
-                        Scalar::new(0.0, 255.0, 0.0, 0.0),
+                        REMOVAL_COLOR
                     )?;
                     let card = remove_white_corners(&green, &display_card)?;
                     let rotated = rotate_image(&card, t as f32, true)?;
@@ -272,7 +273,7 @@ impl CardDisplayManager {
                     let mut roi = frame.roi_mut(rotated_rect)?;
 
                     let card_rotation =
-                        remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                        remove_color(&roi, &rotated, &REMOVAL_COLOR)?;
                     let card_rotation = remove_white_corners(&roi, &card_rotation)?;
 
                     card_rotation.copy_to(&mut roi)?;
@@ -289,7 +290,7 @@ impl CardDisplayManager {
                     let green = UMat::new_size_with_default_def(
                         self.card_back.size()?,
                         self.card_back.typ(),
-                        Scalar::new(0.0, 255.0, 0.0, 0.0),
+                        REMOVAL_COLOR
                     )?;
                     let card = remove_white_corners(&green, &self.card_back)?;
 
@@ -303,7 +304,7 @@ impl CardDisplayManager {
 
                     let mut roi = frame.roi_mut(rotated_rect)?;
                     let card_rotation =
-                        remove_color(&roi, &rotated, &Scalar::new(0.0, 255.0, 0.0, 0.0))?;
+                        remove_color(&roi, &rotated, &REMOVAL_COLOR)?;
                     card_rotation.copy_to(&mut roi)?;
                     Ok(())
                 }
@@ -450,7 +451,7 @@ impl CardDisplayManager {
                     self.tick(time_tick, frame, frame_rect)
                 } else {
                     let roi = frame.roi(self.card_rect)?;
-                    let card = remove_color(&roi, &self.card_back, &GREEN)?;
+                    let card = remove_color(&roi, &self.card_back, &REMOVAL_COLOR)?;
                     place_umat(&card, frame, self.card_rect)?;
                     Ok(())
                 }
@@ -512,6 +513,9 @@ struct Cli {
 
     #[arg(short, long, action)]
     debug: bool,
+
+    #[arg(long, action)]
+    skip_intro: bool,
 
     #[arg(long)]
     crop_left: Option<f64>,
@@ -614,6 +618,16 @@ impl TurnPlayer {
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+    set_use_opencl(true)?;
+
+    let mut platforms = opencv::core::Vector::new();
+    opencv::core::get_platfoms_info(&mut platforms)?;
+
+    // Check debug
+    if args.debug {
+        println!("debugging");
+        simple_logging::log_to_file("log.txt", log::LevelFilter::Debug).unwrap(); 
+    }
 
     // Load game stats
     let mut rows: VecDeque<std::result::Result<DataRow, csv::Error>> = csv::ReaderBuilder::new()
@@ -623,16 +637,22 @@ fn main() -> Result<()> {
         .deserialize()
         .collect();
 
-    let player1_row = rows
+    // Get player names
+    let fst_player_row = rows
         .pop_front()
         .expect("Invalid card file")
         .expect("Invalid row format");
-    let player2_row = rows
+    let snd_player_row = rows
         .pop_front()
         .expect("Invalid card file")
         .expect("Invalid row format");
-    let player1 = player1_row.name;
-    let player2 = player2_row.name;
+    let (player1, player2) = {
+        if fst_player_row.update_type == PLAYER1_DATA_TYPE {
+            (fst_player_row.name, snd_player_row.name)
+        } else {
+            (snd_player_row.name, fst_player_row.name)
+        }
+    };
 
     let first_stats = rows
         .pop_front()
@@ -773,35 +793,35 @@ fn main() -> Result<()> {
         0.0,
         0.0,
         SCOREBOARD_WIDTH_RATIO,
-        0.5,
+        4.0 / 9.0,
         Some(WIDTH_BUFFER_RATIO),
-        Some(HEIGHT_BUFFER_RATIO),
+        Some(2.0 * HEIGHT_BUFFER_RATIO),
         Some(HorizontalPartition::Left),
         Some(VerticalPartition::Top),
     )?;
     let card_rel_roi = RelativeRoi::build_as_partition(
         0.0,
-        0.5,
+        4.0 / 9.0,
         SIDE_PANEL_WIDTH_RATIO,
-        0.5,
+        5.0 / 9.0,
         Some(WIDTH_BUFFER_RATIO),
-        Some(HEIGHT_BUFFER_RATIO),
+        Some(2.0 * HEIGHT_BUFFER_RATIO),
         Some(HorizontalPartition::Left),
         Some(VerticalPartition::Bottom),
     )?;
 
     // Get hero images
     let full_art_manager = FullArtHeroManager::new();
-    let hero1_animation_fp = full_art_manager.get_hero_art_animation_fp(&hero1_stats.name)?;
-    let hero2_animation_fp = full_art_manager.get_hero_art_animation_fp(&hero2_stats.name)?;
+    let hero1_animation_fp = full_art_manager.get_cropped_hero_art_animation_fp(&hero1_stats.name)?;
+    let hero2_animation_fp = full_art_manager.get_cropped_hero_art_animation_fp(&hero2_stats.name)?;
 
-    let mut hero1_animation = VideoCapLooper::build(&hero1_animation_fp)?;
-    let mut hero2_animation = VideoCapLooper::build(&hero2_animation_fp)?;
+    let mut hero1_animation = VideoCapLooperAdj::build(&hero1_animation_fp)?;
+    let mut hero2_animation = VideoCapLooperAdj::build(&hero2_animation_fp)?;
 
     // Load card back
     let card_back_img = load_image(&CARD_BACK_FP)?;
     let green_background =
-        UMat::new_size_with_default_def(card_back_img.size()?, card_back_img.typ(), GREEN)?;
+        UMat::new_size_with_default_def(card_back_img.size()?, card_back_img.typ(), REMOVAL_COLOR)?;
     let card_back_img = remove_white_corners(&green_background, &card_back_img)?;
     let card_back_img = card_rel_roi.resize(&frame_size, &card_back_img)?;
     let card_rect = card_rel_roi.generate_roi(&frame_size, &card_back_img);
@@ -819,19 +839,21 @@ fn main() -> Result<()> {
         true,
     )?;
 
-    // Create intro
-    println!("Generating intro...");
-    generate_intro(
-        &hero1_animation_fp,
-        &player1,
-        &hero2_animation_fp,
-        &player2,
-        &frame_size,
-        card_back_img.typ(),
-        fps,
-        &mut out,
-    )?;
-    println!("Intro generated!");
+    if !args.skip_intro {
+        // Create intro
+        println!("Generating intro...");
+        generate_intro(
+            &hero1_animation_fp,
+            &player1,
+            &hero2_animation_fp,
+            &player2,
+            &frame_size,
+            card_back_img.typ(),
+            fps,
+            &mut out,
+        )?;
+        println!("Intro generated!");
+    }
 
     // Load GoToOne Logo
     let logo_image = load_image(&LOGO_FP)?;
@@ -873,10 +895,10 @@ fn main() -> Result<()> {
     let mut card_display_manager = CardDisplayManager::new(&card_rect, &card_back_img, &time_tick);
 
     // Cut beginning of video where intro would be
-    for _ in 0..(INTRO_TIME * fps) as i32 {
-        let mut frame = UMat::new_def();
-        cap.read(&mut frame)?;
-        time_tick.increment_milli(increment);
+    if !args.skip_intro {
+        let intro_frames = INTRO_TIME * fps;
+        cap.set(CAP_PROP_POS_FRAMES, intro_frames)?;
+        time_tick.increment_milli(increment * intro_frames);
     }
 
     // LOOP HERE
@@ -895,7 +917,7 @@ fn main() -> Result<()> {
         // Increment life ticker
         player1_life_tracker.tick_display();
         player2_life_tracker.tick_display();
-
+        
         // Grab frame
         if !cap.read(&mut frame).unwrap_or(false) {
             break;
@@ -933,6 +955,7 @@ fn main() -> Result<()> {
         let mut innerframe = UMat::new_def();
         crop_roi.copy_to(&mut innerframe)?;
 
+        // Reframe
         let reframe = innerframe_rel_roi.resize(&frame_size, &innerframe)?;
         let frame_roi_rect = innerframe_rel_roi.generate_roi(&frame_size, &innerframe);
         let mut frame_roi = background.roi_mut(frame_roi_rect)?;
@@ -950,14 +973,30 @@ fn main() -> Result<()> {
         frame = background;
 
         // Heroes
+        let now = std::time::Instant::now();
         let hero1_image = hero1_animation.read()?;
-        let mut hero1_image = FullArtHeroManager::crop_hero_img(&hero1_image)?;
-        flip(&hero1_image.clone(), &mut hero1_image, 1)?;
+        let elapsed = now.elapsed();
+        debug!("Read hero: {:?}", elapsed);
+
+        // let now = std::time::Instant::now();
+        // let hero1_image = FullArtHeroManager::crop_hero_img(&hero1_image)?;
+        // let elapsed = now.elapsed();
+        // debug!("Crop hero: {:?}", elapsed);
+
+        let now = std::time::Instant::now();
         let hero1_rect = hero1_rel_roi.generate_roi(&frame_size, &hero1_image);
-        let hero1_image = hero1_rel_roi.resize(&frame_size, &hero1_image)?;
+        let mut hero1_image = hero1_rel_roi.resize(&frame_size, &hero1_image)?;
+        let elapsed = now.elapsed();
+        debug!("Resize hero: {:?}", elapsed);
+
+        let now = std::time::Instant::now();
+        flip(&hero1_image.clone(), &mut hero1_image, 1)?;
+        let elapsed = now.elapsed();
+        debug!("Flip hero: {:?}", elapsed);
 
         let mut hero1_roi = frame.roi_mut(hero1_rect)?;
         hero1_image.copy_to(hero1_roi.borrow_mut())?;
+
         let hero1_color = {
             if winner.is_some_and(|v| v == 1) {
                 HERO_WIN_COLOR
@@ -977,7 +1016,7 @@ fn main() -> Result<()> {
         )?;
 
         let hero2_image = hero2_animation.read()?;
-        let hero2_image = FullArtHeroManager::crop_hero_img(&hero2_image)?;
+        // let hero2_image = FullArtHeroManager::crop_hero_img(&hero2_image)?;
         let hero2_rect = hero2_rel_roi.generate_roi(&frame_size, &hero2_image);
         let hero2_image = hero2_rel_roi.resize(&frame_size, &hero2_image)?;
 
@@ -1002,6 +1041,7 @@ fn main() -> Result<()> {
             0,
         )?;
 
+        // Player details
         let left_rect = life1_rel_roi.generate_roi_raw(&frame_size);
         let right_rect = life2_rel_roi.generate_roi_raw(&frame_size);
 

@@ -1,7 +1,7 @@
 use opencv::{
     core::{bitwise_not_def, flip, Rect, Scalar, Size, UMat, UMatTraitConst},
     imgproc::{cvt_color_def, resize_def, COLOR_BGR2GRAY, COLOR_GRAY2RGB, FONT_HERSHEY_SIMPLEX},
-    videoio::{VideoCapture, VideoCaptureTrait, VideoWriter, VideoWriterTrait},
+    videoio::{VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst, VideoWriter, VideoWriterTrait, CAP_PROP_FRAME_COUNT, CAP_PROP_POS_FRAMES},
 };
 
 use crate::{
@@ -62,6 +62,38 @@ impl VideoCapLooper {
         cvt_color_def(&frame, &mut inverted_frame, COLOR_GRAY2RGB)?;
 
         Ok(inverted_frame)
+    }
+}
+
+
+pub struct VideoCapLooperAdj {
+    cap: VideoCapture,
+    frames: f64,
+    index: f64
+}
+
+impl VideoCapLooperAdj {
+    pub fn build(video_fp: &str) -> Result<Self> {
+        let cap = VideoCapture::from_file_def(video_fp)?;
+        let frames = cap.get(CAP_PROP_FRAME_COUNT)?;
+
+        Ok(Self {
+            cap,
+            frames,
+            index: 0.0,
+        })
+    }
+
+    pub fn read(&mut self) -> Result<UMat> {
+        let mut frame = UMat::new_def();
+        if self.index >= self.frames {
+            self.index = 0.0;
+            self.cap.set(CAP_PROP_POS_FRAMES, self.index)?;
+        }
+        self.index += 1.0;
+        self.cap.read(&mut frame)?;
+
+        Ok(frame)
     }
 }
 
@@ -254,7 +286,7 @@ mod test {
     fn test_intro() -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = VideoWriter::new_def(
             "data/test/intro_test.mp4",
-            VideoWriter::fourcc('a', 'v', 'c', '1').unwrap(),
+            VideoWriter::fourcc('m', 'p', '4', 'v').unwrap(),
             60.0,
             Size::new(1920, 1080),
         )?;
